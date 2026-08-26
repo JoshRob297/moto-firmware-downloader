@@ -1,0 +1,17 @@
+# Environment and State files (contain session JWT tokens)
+.mfd-cli-state.json
+.*.json
+*.log
+*.tmp
+*.bin
+*.img
+*.zip
+
+# Node modules
+node_modules/
+package-lock.json
+
+# OS and Editor
+.DS_Store
+.vscode/
+.idea/
