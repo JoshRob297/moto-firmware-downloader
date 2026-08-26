@@ -1,3 +1,5 @@
+#!/usr/bin/env node
+
 import { createInterface } from "node:readline/promises";
 import { execSync } from "node:child_process";
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
@@ -43,7 +45,7 @@ function saveState() {
     jwt: session.jwt,
     rsaPublicKey: session.rsaPublicKey,
     cookies: Object.fromEntries(cookieJar.entries())
-  }, null, 2));
+  }, null, 2), { mode: 0o600, encoding: "utf8" });
 }
 
 function serializeCookies() {
@@ -51,9 +53,19 @@ function serializeCookies() {
 }
 
 function updateCookies(headers) {
-  const sc = headers.get("set-cookie");
-  if (!sc) return;
-  for (const line of sc.split(",")) {
+  // Use getSetCookie if available (Node 18.14.0+) or split fallback
+  let setCookies = [];
+  if (typeof headers.getSetCookie === "function") {
+    setCookies = headers.getSetCookie();
+  } else {
+    const sc = headers.get("set-cookie");
+    if (sc) {
+      // Split by comma only when followed by a cookie-name= (not inside dates like 'Expires=Wed, 21 Oct')
+      setCookies = sc.split(/,(?=[^;,]+=[^;,]+)/);
+    }
+  }
+
+  for (const line of setCookies) {
     const pair = line.split(";")[0].trim();
     const eq = pair.indexOf("=");
     if (eq > 0) {
@@ -185,13 +197,34 @@ function openBrowser(url) {
 function extractToken(input) {
   if (!input) return null;
   input = input.trim();
-  const m = input.match(/(?:Authorization|token)=([^&\s"<>]+)/i);
-  if (m?.[1]) return decodeURIComponent(m[1]);
-  if (/^[a-zA-Z0-9_-]{16,512}$/.test(input)) return input;
+  
+  // URL parameter matching: Authorization=... or token=... or auth=...
+  const m = input.match(/(?:Authorization|token|auth)=([^&\s"<>]+)/i);
+  if (m?.[1]) {
+    let token = decodeURIComponent(m[1]).trim();
+    if (token.startsWith("Bearer ")) token = token.slice(7).trim();
+    return token;
+  }
+  
+  // Plain Bearer string: "Bearer eyJhbG..." or "Bearer abc123..."
+  if (input.startsWith("Bearer ")) {
+    input = input.slice(7).trim();
+  }
+  
+  // Raw token (JWT with dots, base64, hex or alphanumerics)
+  if (/^[a-zA-Z0-9_.-]{16,4096}$/.test(input)) {
+    return input;
+  }
+  
   return null;
 }
 
 async function login() {
+  if (session.jwt) {
+    console.log("Notice: An active session is currently saved in", STATE_FILE);
+    console.log("Proceeding with login will overwrite the existing token.\n");
+  }
+
   const r0 = await fetch(BASE_URL + "/lmsa-web/index.jsp", { redirect: "manual" });
   updateCookies(r0.headers);
   await fetchRsaKey();
@@ -200,7 +233,7 @@ async function login() {
   const loginUrl = new URL(rawLoginUrl);
   loginUrl.searchParams.set("redirect_uri", "https://lsa.lenovo.com/Tips/lenovoIdSuccess.html");
 
-  console.log("\n=======================================================");
+  console.log("=======================================================");
   console.log("AUTHENTICATION");
   console.log("=======================================================");
   console.log("1. Open this URL in your web browser:\n");
@@ -295,12 +328,26 @@ async function searchParameters(modelName) {
   console.log("Required Parameters:", JSON.stringify(data?.content, null, 2));
 }
 
-function parseCarrierArg(args) {
-  const idx = args.findIndex(a => a === "--carrier" || a === "-c");
-  if (idx !== -1 && args[idx + 1]) {
-    return args[idx + 1];
+function parseImeiArgs(args) {
+  let carrier = "retla";
+  const positional = [];
+  
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === "--carrier" || args[i] === "-c") {
+      if (args[i + 1]) {
+        carrier = args[i + 1];
+        i++;
+      }
+    } else {
+      positional.push(args[i]);
+    }
   }
-  return "retla";
+  
+  return {
+    model: positional[0],
+    imei: positional[1],
+    carrier
+  };
 }
 
 // CLI Routing
@@ -310,9 +357,7 @@ const command = process.argv[2];
 if (command === "login") {
   await login();
 } else if (command === "imei") {
-  const model = process.argv[3];
-  const imei = process.argv[4];
-  const carrier = parseCarrierArg(process.argv.slice(5));
+  const { model, imei, carrier } = parseImeiArgs(process.argv.slice(3));
   if (!model || !imei) {
     console.error("Usage: node mfd-cli.mjs imei <Model> <IMEI> [--carrier <Carrier>]");
     console.error("Example: node mfd-cli.mjs imei XT2435-1 351234567890123 --carrier retla");

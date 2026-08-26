@@ -6,11 +6,25 @@ This tool bypasses the `410 Missing device fingerprint` and `411 Invalid device 
 
 ## Credits and Acknowledgments
 * **Concept and Base Architecture:** Based on the foundational work by [enigma550/LenovoMotoFirmwareDownloader].
-* **2024 Security Bypass & Reverse Engineering:** Reverse engineering of the `webservices.dll`, discovery of the `X-Device-Fingerprint` RSA PKCS#1 v1.5 encryption algorithm, and Node.js implementation by **JoshRob**.
+* **2024 Security Bypass & Reverse Engineering:** Reverse engineering of `webservices.dll`, discovery of the `X-Device-Fingerprint` RSA PKCS#1 v1.5 encryption algorithm, and Node.js implementation by **JoshRob**.
 
 ## Requirements
 * Node.js v18.0 or higher.
-* No third-party npm packages required (pure native implementation using Node.js `crypto`, `http`, `readline`, and `fs` modules).
+* Zero external dependencies (built with native Node.js `crypto`, `readline`, `child_process`, and `fs` modules).
+
+## Installation
+
+Clone the repository and run directly:
+```bash
+git clone https://github.com/JoshRob297/moto-firmware-downloader.git
+cd moto-firmware-downloader
+chmod +x mfd-cli.mjs
+```
+
+*(Optional)* Install globally to use the `mfd` command from anywhere:
+```bash
+npm link
+```
 
 ## Usage
 
@@ -18,6 +32,8 @@ This tool bypasses the `410 Missing device fingerprint` and `411 Invalid device 
 The Motorola API requires a valid OAuth session. Run the login command to generate an official authentication link:
 ```bash
 node mfd-cli.mjs login
+# or if installed globally:
+mfd login
 ```
 1. Open the URL printed in the terminal in your browser.
 2. Log in with your Motorola account.
@@ -43,7 +59,7 @@ node mfd-cli.mjs imei XT2435-1 351234567890123
 node mfd-cli.mjs imei XT2435-1 351234567890123 --carrier reteu
 ```
 
-The tool will output the direct, signed AWS S3 download links for the full ROM package and flash tools.
+The tool outputs direct, signed AWS S3 download links for the full ROM package and flash tools.
 
 ### 3. Query Device Match Parameters
 Query the specific parameters required by the Motorola backend to match ROMs for a specific model code:

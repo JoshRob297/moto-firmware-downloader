@@ -7,6 +7,12 @@
   "bin": {
     "mfd": "./mfd-cli.mjs"
   },
+  "scripts": {
+    "start": "node mfd-cli.mjs"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
   "keywords": [
     "motorola",
     "moto",
