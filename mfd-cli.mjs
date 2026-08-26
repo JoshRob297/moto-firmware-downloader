@@ -1,4 +1,4 @@
-import { createServer } from "node:http";
+import { createInterface } from "node:readline/promises";
 import { execSync } from "node:child_process";
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
@@ -15,7 +15,7 @@ const STATE_FILE = join(homedir(), ".mfd-cli-state.json");
 const session = {
   guid: crypto.randomUUID(),
   clientUuid: crypto.randomUUID(),
-  jwt: "",
+  jwt: process.env.MFD_JWT || "",
   rsaPublicKey: ""
 };
 const cookieJar = new Map();
@@ -26,7 +26,7 @@ function loadState() {
     const data = JSON.parse(readFileSync(STATE_FILE, "utf8"));
     if (data.guid) session.guid = data.guid;
     if (data.clientUuid) session.clientUuid = data.clientUuid;
-    if (data.jwt) session.jwt = data.jwt;
+    if (data.jwt && !session.jwt) session.jwt = data.jwt;
     if (data.rsaPublicKey) session.rsaPublicKey = data.rsaPublicKey;
     if (data.cookies) {
       for (const [k, v] of Object.entries(data.cookies)) {
@@ -94,18 +94,22 @@ function createClientRequestFinger(url, authToken, serverPublicKeyBase64) {
 }
 
 async function fetchRsaKey() {
-  const r = await fetch(API_URL + "/common/rsa.jhtml", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "Request-Tag": "lmsa",
-      "User-Agent": USER_AGENT,
-    },
-    body: JSON.stringify({ client: { version: CLIENT_VERSION }, language: "en-US", dparams: {} })
-  });
-  const data = await r.json();
-  if (data?.desc && data.desc.length > 20) {
-    session.rsaPublicKey = data.desc;
+  try {
+    const r = await fetch(API_URL + "/common/rsa.jhtml", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Request-Tag": "lmsa",
+        "User-Agent": USER_AGENT,
+      },
+      body: JSON.stringify({ client: { version: CLIENT_VERSION }, language: "en-US", dparams: {} })
+    });
+    const data = await r.json();
+    if (data?.desc && data.desc.length > 20) {
+      session.rsaPublicKey = data.desc;
+    }
+  } catch (err) {
+    console.warn("Warning: Could not fetch daily RSA public key:", err.message);
   }
 }
 
@@ -143,7 +147,7 @@ async function apiRequest(path, body = {}, opts = {}) {
   });
   updateCookies(r.headers);
   const ah = r.headers.get("Authorization");
-  if (ah) session.jwt = ah.startsWith("Bearer ") ? ah : ah;
+  if (ah) session.jwt = ah;
   return r;
 }
 
@@ -162,52 +166,29 @@ async function getLoginUrl() {
       if (p?.login_url) return p.login_url;
     } catch {}
   }
-  throw new Error("Could not get login URL: " + JSON.stringify(data));
+  throw new Error("Could not retrieve login URL: " + JSON.stringify(data));
 }
 
-async function waitForCallback(rawLoginUrl) {
-  return new Promise((resolve, reject) => {
-    const server = createServer(async (req, res) => {
-      const url = new URL(req.url, "http://localhost:9874");
-      if (!url.searchParams.has("code")) {
-        res.end("Waiting for OAuth authorization...");
-        return;
-      }
-      res.end("<html><body><h2>Login successful. You can close this tab.</h2></body></html>");
-      server.close();
-      try {
-        const loginUrl = new URL(rawLoginUrl);
-        const state = loginUrl.searchParams.get("state") || url.searchParams.get("state") || "";
-        const code = url.searchParams.get("code");
-        const r = await apiRequest("/user/oauth2/callback.jhtml?code=" + code + "&state=" + state, {}, { method: "GET", withoutAuth: true });
-        const text = await r.text();
-        const m = text.match(/Authorization=([^&\s"<>]+)/i);
-        if (m?.[1]) {
-          resolve(decodeURIComponent(m[1]));
-          return;
-        }
-        try {
-          const json = JSON.parse(text);
-          const proto = json?.content || json?.msg || "";
-          const m2 = proto.match(/Authorization=([^&\s"<>]+)/i);
-          if (m2?.[1]) {
-            resolve(decodeURIComponent(m2[1]));
-            return;
-          }
-        } catch {}
-        reject(new Error("Token not found in response: " + text));
-      } catch (e) {
-        reject(e);
-      }
-    });
-    server.listen(9874, "127.0.0.1", () => {
-      console.log("Local OAuth callback listener active on http://127.0.0.1:9874");
-    });
-    setTimeout(() => {
-      server.close();
-      reject(new Error("OAuth login timed out after 5 minutes"));
-    }, 5 * 60 * 1000);
-  });
+function openBrowser(url) {
+  try {
+    const platform = process.platform;
+    if (platform === "win32") {
+      execSync(`start "" "${url}"`, { stdio: "ignore" });
+    } else if (platform === "darwin") {
+      execSync(`open "${url}"`, { stdio: "ignore" });
+    } else {
+      execSync(`xdg-open "${url}" 2>/dev/null || true`, { stdio: "ignore" });
+    }
+  } catch {}
+}
+
+function extractToken(input) {
+  if (!input) return null;
+  input = input.trim();
+  const m = input.match(/(?:Authorization|token)=([^&\s"<>]+)/i);
+  if (m?.[1]) return decodeURIComponent(m[1]);
+  if (/^[a-zA-Z0-9_-]{16,512}$/.test(input)) return input;
+  return null;
 }
 
 async function login() {
@@ -220,27 +201,37 @@ async function login() {
   loginUrl.searchParams.set("redirect_uri", "https://lsa.lenovo.com/Tips/lenovoIdSuccess.html");
 
   console.log("\n=======================================================");
-  console.log("OPEN THIS URL IN YOUR BROWSER TO AUTHENTICATE:");
+  console.log("AUTHENTICATION");
+  console.log("=======================================================");
+  console.log("1. Open this URL in your web browser:\n");
   console.log(loginUrl.toString());
+  console.log("\n2. Log in with your Motorola account.");
+  console.log("3. When redirection completes, copy the full URL from your address bar (or the Authorization parameter value).");
   console.log("=======================================================\n");
 
-  try {
-    execSync("xdg-open '" + loginUrl.toString() + "' 2>/dev/null || true");
-  } catch {}
+  openBrowser(loginUrl.toString());
 
-  console.log("After logging in, copy the full callback URL from your browser address bar or paste the Authorization token:");
-  const token = await waitForCallback(rawLoginUrl).catch(() => null);
-  
-  if (token) {
-    session.jwt = token.startsWith("Bearer ") ? token : token;
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    const input = await rl.question("Paste the redirect URL or Authorization token here: ");
+    const token = extractToken(input);
+    
+    if (!token) {
+      console.error("\nError: Could not extract a valid Authorization token from the provided input.");
+      process.exit(1);
+    }
+    
+    session.jwt = token;
     saveState();
-    console.log("Login successful! Session saved to", STATE_FILE);
+    console.log("\nLogin successful! Session saved to", STATE_FILE);
+  } finally {
+    rl.close();
   }
 }
 
-async function searchByImei(modelName, imei) {
+async function searchByImei(modelName, imei, carrier = "retla") {
   if (!session.jwt) {
-    console.error("No active session found. Please run 'node mfd-cli.mjs login' first.");
+    console.error("No active session found. Please run 'node mfd-cli.mjs login' or set MFD_JWT environment variable first.");
     process.exit(1);
   }
   
@@ -248,11 +239,11 @@ async function searchByImei(modelName, imei) {
     await fetchRsaKey();
   }
 
-  console.log(`\nFetching firmware for model: ${modelName} | IMEI: ${imei}...`);
+  console.log(`\nFetching firmware for model: ${modelName} | IMEI: ${imei} | Carrier: ${carrier}...`);
   const r = await apiRequest("/rescueDevice/getNewResourceByImei.jhtml", {
     imei,
     modelCode: modelName,
-    roCarrier: "retla",
+    roCarrier: carrier,
     encryptCode: Math.random().toString(36).slice(2, 10).toUpperCase(),
     sku: modelName,
     carrierSku: modelName
@@ -304,6 +295,14 @@ async function searchParameters(modelName) {
   console.log("Required Parameters:", JSON.stringify(data?.content, null, 2));
 }
 
+function parseCarrierArg(args) {
+  const idx = args.findIndex(a => a === "--carrier" || a === "-c");
+  if (idx !== -1 && args[idx + 1]) {
+    return args[idx + 1];
+  }
+  return "retla";
+}
+
 // CLI Routing
 loadState();
 const command = process.argv[2];
@@ -313,12 +312,13 @@ if (command === "login") {
 } else if (command === "imei") {
   const model = process.argv[3];
   const imei = process.argv[4];
+  const carrier = parseCarrierArg(process.argv.slice(5));
   if (!model || !imei) {
-    console.error("Usage: node mfd-cli.mjs imei <Model> <IMEI>");
-    console.error("Example: node mfd-cli.mjs imei XT2435-1 351234567890123");
+    console.error("Usage: node mfd-cli.mjs imei <Model> <IMEI> [--carrier <Carrier>]");
+    console.error("Example: node mfd-cli.mjs imei XT2435-1 351234567890123 --carrier retla");
     process.exit(1);
   }
-  await searchByImei(model, imei);
+  await searchByImei(model, imei, carrier);
 } else if (command === "search") {
   const model = process.argv[3];
   if (!model) {
@@ -330,6 +330,8 @@ if (command === "login") {
   console.log("Moto Firmware Downloader (MFD)");
   console.log("Usage:");
   console.log("  node mfd-cli.mjs login");
-  console.log("  node mfd-cli.mjs imei <Model> <IMEI>");
+  console.log("  node mfd-cli.mjs imei <Model> <IMEI> [--carrier <Carrier>]");
   console.log("  node mfd-cli.mjs search <Model>");
+  console.log("\nOptions:");
+  console.log("  --carrier, -c   Carrier code (default: retla)");
 }

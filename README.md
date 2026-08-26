@@ -10,26 +10,37 @@ This tool bypasses the `410 Missing device fingerprint` and `411 Invalid device 
 
 ## Requirements
 * Node.js v18.0 or higher.
-* No third-party npm packages required (pure native implementation using Node.js `crypto`, `http`, and `fs` modules).
+* No third-party npm packages required (pure native implementation using Node.js `crypto`, `http`, `readline`, and `fs` modules).
 
 ## Usage
 
 ### 1. Authentication
-The Motorola API requires a valid OAuth session. Run the login command to generate a local callback server and an official authentication link:
+The Motorola API requires a valid OAuth session. Run the login command to generate an official authentication link:
 ```bash
 node mfd-cli.mjs login
 ```
-Open the provided URL in your browser, log in with your Motorola account, and the script will automatically capture the session token and the server's daily RSA public key.
+1. Open the URL printed in the terminal in your browser.
+2. Log in with your Motorola account.
+3. When the browser redirects to the success page, copy the full URL from your address bar (or the `Authorization=` token) and paste it into the terminal prompt.
+
+*Alternatively, you can provide the token directly via environment variable without running the login command:*
+```bash
+export MFD_JWT="your_authorization_token_here"
+```
 
 ### 2. Download Firmware by IMEI
 Retrieve the official factory firmware, fastboot tools, and flash sequence for a specific device using its IMEI:
 ```bash
-node mfd-cli.mjs imei <Model> <IMEI>
+node mfd-cli.mjs imei <Model> <IMEI> [--carrier <Carrier>]
 ```
 
-**Example:**
+**Examples:**
 ```bash
+# Retail Latin America (default)
 node mfd-cli.mjs imei XT2435-1 351234567890123
+
+# Custom carrier channel (e.g. retus, reteu, retbr)
+node mfd-cli.mjs imei XT2435-1 351234567890123 --carrier reteu
 ```
 
 The tool will output the direct, signed AWS S3 download links for the full ROM package and flash tools.
@@ -45,3 +56,6 @@ Motorola servers enforce the `X-Device-Fingerprint` HTTP header. This tool imple
 1. Requests the server's public key dynamically from `/common/rsa.jhtml`.
 2. Constructs a plain text string: `Timestamp|JWT_Token|EndpointNameinterface`.
 3. Encrypts the string using RSA PKCS#1 v1.5 padding with the server public key and encodes the payload in Base64.
+
+## License
+MIT License. See [LICENSE](LICENSE) for details.
