@@ -1,0 +1,20 @@
+{
+  "name": "moto-firmware-downloader",
+  "version": "1.0.0",
+  "description": "CLI tool to download official Motorola firmware with RSA security bypass",
+  "type": "module",
+  "main": "mfd-cli.mjs",
+  "bin": {
+    "mfd": "./mfd-cli.mjs"
+  },
+  "keywords": [
+    "motorola",
+    "moto",
+    "firmware",
+    "downloader",
+    "rsa",
+    "fastboot"
+  ],
+  "author": "JoshRob",
+  "license": "MIT"
+}
