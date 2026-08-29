@@ -15,6 +15,7 @@ This tool bypasses the `410 Missing device fingerprint` and `411 Invalid device 
 ## Credits and Acknowledgments
 * **Concept and Base Architecture:** Based on the foundational work by [enigma550/LenovoMotoFirmwareDownloader].
 * **2024 Security Bypass & Reverse Engineering:** Reverse engineering of `webservices.dll`, discovery of the `X-Device-Fingerprint` RSA PKCS#1 v1.5 encryption algorithm, and Node.js implementation by **JoshRob**.
+* **Community Discussion:** [Official Thread on XDA Forums](https://xdaforums.com/t/tool-cross-platform-moto-firmware-downloader-mfd-v1-1-0-official-s3-roms-rsa-410-411-bypass.4799998/)
 
 ---
 
