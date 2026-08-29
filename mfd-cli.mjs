@@ -5,7 +5,7 @@ import { execSync } from "node:child_process";
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
-import { publicEncrypt, constants } from "node:crypto";
+import { publicEncrypt, constants, randomUUID } from "node:crypto";
 
 const BASE_URL = "https://lsa.lenovo.com";
 const API_URL = BASE_URL + "/Interface";
@@ -15,8 +15,8 @@ const WINDOWS_INFO = "Microsoft Windows 10 Pro, 64-bit";
 const STATE_FILE = join(homedir(), ".mfd-cli-state.json");
 
 const session = {
-  guid: crypto.randomUUID(),
-  clientUuid: crypto.randomUUID(),
+  guid: randomUUID(),
+  clientUuid: randomUUID(),
   jwt: process.env.MFD_JWT || "",
   rsaPublicKey: ""
 };
