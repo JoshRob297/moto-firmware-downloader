@@ -19,7 +19,7 @@ This tool bypasses the `410 Missing device fingerprint` and `411 Invalid device 
 
 ## Requirements
 * **Node.js:** v18.0 or higher.
-* **Zero Dependencies:** Built exclusively with native Node.js built-ins (`crypto`, `readline`, `child_process`, `fs`).
+* **Zero Dependencies:** Built exclusively with native Node.js built-ins (`crypto`, `readline`, `child_process`, `stream`, `fs`).
 
 ---
 
@@ -60,24 +60,34 @@ export MFD_JWT="your_authorization_token_here"
 ### 2. Download Firmware by IMEI
 Retrieve the official factory firmware, fastboot tools, and flash sequence for a specific device using its IMEI:
 ```bash
-node mfd-cli.mjs imei <Model> <IMEI> [--carrier <Carrier>]
+mfd imei <Model> <IMEI> [options]
 ```
+
+**Options:**
+* `-c, --carrier <Carrier>`: Target carrier channel (default: `retla`).
+* `-d, --download`: Directly download the ROM and Fastboot Tool ZIP files to the current directory with live progress.
+* `--json`: Output raw API response in structured JSON format (ideal for automation and scripting).
+* `--urls-only`: Output only direct, signed AWS S3 download links (one per line) for piping into `curl`, `wget`, or `aria2c`.
 
 **Examples:**
 ```bash
 # Retail Latin America (default)
-node mfd-cli.mjs imei XT2435-1 351234567890123
+mfd imei XT2435-1 351234567890123
 
 # Custom carrier channel (e.g. retus, reteu, retbr)
-node mfd-cli.mjs imei XT2435-1 351234567890123 --carrier reteu
-```
+mfd imei XT2435-1 351234567890123 --carrier reteu
 
-The tool outputs direct, signed AWS S3 download links for the full ROM package and flash tools.
+# Direct download with progress bar
+mfd imei XT2435-1 351234567890123 --download
+
+# Pipe download URLs directly to aria2c
+mfd imei XT2435-1 351234567890123 --urls-only | xargs -n 1 aria2c -x 8
+```
 
 ### 3. Query Device Match Parameters
 Query the specific parameters required by the Motorola backend to match ROMs for a specific model code:
 ```bash
-node mfd-cli.mjs search <Model>
+mfd search <Model> [--json]
 ```
 
 ---
@@ -92,12 +102,10 @@ Motorola servers enforce the `X-Device-Fingerprint` HTTP header. This tool imple
 
 ## Troubleshooting
 
-- **Error: "No active session found"**  
-  Run `node mfd-cli.mjs login` or set `export MFD_JWT="..."` before executing queries.
+- **Error: "No active session found" / "Authentication Error"**  
+  Run `mfd login` (or set `export MFD_JWT="..."`) to generate or refresh your token.
 - **Empty results or "ROM not found"**  
   Verify the exact model code (e.g., `XT2435-1` vs `XT2435-3`) and try specifying the correct carrier channel using `--carrier <name>` (e.g., `retla`, `reteu`, `retus`).
-- **Authorization Token Expiration**  
-  Motorola OAuth tokens have a rolling expiration. If requests start failing, simply re-run `node mfd-cli.mjs login` to renew your session.
 
 ---
 
