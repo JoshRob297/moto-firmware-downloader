@@ -1,30 +1,43 @@
 # Moto Firmware Downloader (MFD)
 
+[![CI](https://github.com/JoshRob297/moto-firmware-downloader/actions/workflows/ci.yml/badge.svg)](https://github.com/JoshRob297/moto-firmware-downloader/actions/workflows/ci.yml)
+[![Node Version](https://img.shields.io/badge/node-%3E%3D18.0.0-brightgreen.svg)](https://nodejs.org/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Zero Dependencies](https://img.shields.io/badge/dependencies-0-blue.svg)](#requirements)
+
 A modern, standalone Node.js CLI tool to authenticate with the Motorola Rescue and Smart Assistant (RSA) API and retrieve official firmware download links directly from secure AWS S3 buckets.
 
 This tool bypasses the `410 Missing device fingerprint` and `411 Invalid device fingerprint` errors introduced in the 2024-2026 server security updates by dynamically replicating the RSA encryption implemented in the official Windows client.
+
+---
 
 ## Credits and Acknowledgments
 * **Concept and Base Architecture:** Based on the foundational work by [enigma550/LenovoMotoFirmwareDownloader].
 * **2024 Security Bypass & Reverse Engineering:** Reverse engineering of `webservices.dll`, discovery of the `X-Device-Fingerprint` RSA PKCS#1 v1.5 encryption algorithm, and Node.js implementation by **JoshRob**.
 
+---
+
 ## Requirements
-* Node.js v18.0 or higher.
-* Zero external dependencies (built with native Node.js `crypto`, `readline`, `child_process`, and `fs` modules).
+* **Node.js:** v18.0 or higher.
+* **Zero Dependencies:** Built exclusively with native Node.js built-ins (`crypto`, `readline`, `child_process`, `fs`).
+
+---
 
 ## Installation
 
-Clone the repository and run directly:
+Clone the repository and mark the script as executable:
 ```bash
 git clone https://github.com/JoshRob297/moto-firmware-downloader.git
 cd moto-firmware-downloader
 chmod +x mfd-cli.mjs
 ```
 
-*(Optional)* Install globally to use the `mfd` command from anywhere:
+*(Optional)* Install globally to use the `mfd` command from anywhere on your system:
 ```bash
 npm link
 ```
+
+---
 
 ## Usage
 
@@ -67,11 +80,31 @@ Query the specific parameters required by the Motorola backend to match ROMs for
 node mfd-cli.mjs search <Model>
 ```
 
+---
+
 ## Technical Details: The Fingerprint Bypass
 Motorola servers enforce the `X-Device-Fingerprint` HTTP header. This tool implements the reverse-engineered logic from the official Windows client:
 1. Requests the server's public key dynamically from `/common/rsa.jhtml`.
 2. Constructs a plain text string: `Timestamp|JWT_Token|EndpointNameinterface`.
 3. Encrypts the string using RSA PKCS#1 v1.5 padding with the server public key and encodes the payload in Base64.
+
+---
+
+## Troubleshooting
+
+- **Error: "No active session found"**  
+  Run `node mfd-cli.mjs login` or set `export MFD_JWT="..."` before executing queries.
+- **Empty results or "ROM not found"**  
+  Verify the exact model code (e.g., `XT2435-1` vs `XT2435-3`) and try specifying the correct carrier channel using `--carrier <name>` (e.g., `retla`, `reteu`, `retus`).
+- **Authorization Token Expiration**  
+  Motorola OAuth tokens have a rolling expiration. If requests start failing, simply re-run `node mfd-cli.mjs login` to renew your session.
+
+---
+
+## Disclaimer
+This project is an independent open-source tool developed for research, device recovery, and unbricking purposes. It is not affiliated with, sponsored by, or endorsed by Motorola Mobility LLC or Lenovo Group Limited.
+
+---
 
 ## License
 MIT License. See [LICENSE](LICENSE) for details.
