@@ -1,0 +1,44 @@
+name: Publish to NPM
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.x
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Run verification & tests
+        run: npm test
+
+      - name: Check if version already published
+        id: check_version
+        run: |
+          CURRENT_VERSION=$(node -p "require('./package.json').version")
+          if npm view "moto-firmware-downloader@$CURRENT_VERSION" version >/dev/null 2>&1; then
+            echo "Notice: Version $CURRENT_VERSION is already published on NPM registry."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Version $CURRENT_VERSION is new. Ready to publish."
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish to NPM
+        if: steps.check_version.outputs.skip != 'true'
+        run: npm publish --access public --provenance
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

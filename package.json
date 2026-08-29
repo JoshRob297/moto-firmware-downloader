@@ -1,11 +1,32 @@
 {
   "name": "moto-firmware-downloader",
-  "version": "1.0.0",
-  "description": "CLI tool to download official Motorola firmware with RSA security bypass",
+  "version": "1.1.0",
+  "description": "CLI tool to download official Motorola factory firmware and fastboot rescue tools with RSA 410/411 security bypass",
   "type": "module",
   "main": "mfd-cli.mjs",
   "bin": {
-    "mfd": "./mfd-cli.mjs"
+    "mfd": "mfd-cli.mjs",
+    "moto-firmware-downloader": "mfd-cli.mjs"
+  },
+  "files": [
+    "mfd-cli.mjs",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "start": "node mfd-cli.mjs",
+    "test": "node --check mfd-cli.mjs && node mfd-cli.mjs"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/JoshRob297/moto-firmware-downloader.git"
+  },
+  "bugs": {
+    "url": "https://github.com/JoshRob297/moto-firmware-downloader/issues"
+  },
+  "homepage": "https://github.com/JoshRob297/moto-firmware-downloader#readme",
+  "engines": {
+    "node": ">=18.0.0"
   },
   "keywords": [
     "motorola",
@@ -13,7 +34,10 @@
     "firmware",
     "downloader",
     "rsa",
-    "fastboot"
+    "fastboot",
+    "rom",
+    "unbrick",
+    "rescue"
   ],
   "author": "JoshRob",
   "license": "MIT"
