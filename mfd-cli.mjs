@@ -25,7 +25,7 @@ import {
   createHash
 } from "node:crypto";
 
-const VERSION = "1.2.0";
+const VERSION = "1.2.1";
 const BASE_URL = "https://lsa.lenovo.com";
 const API_URL = BASE_URL + "/Interface";
 const USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
