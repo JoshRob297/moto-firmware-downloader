@@ -2,14 +2,30 @@
 
 import { createInterface } from "node:readline/promises";
 import { spawn } from "node:child_process";
-import { readFileSync, writeFileSync, renameSync, unlinkSync, existsSync, chmodSync, createWriteStream } from "node:fs";
+import {
+  readFileSync,
+  writeFileSync,
+  renameSync,
+  unlinkSync,
+  existsSync,
+  chmodSync,
+  createWriteStream,
+  statSync
+} from "node:fs";
+import { open } from "node:fs/promises";
 import { pipeline } from "node:stream/promises";
 import { Readable } from "node:stream";
-import { join, basename } from "node:path";
+import { join, basename, resolve } from "node:path";
 import { homedir } from "node:os";
-import { publicEncrypt, constants, randomUUID, randomBytes } from "node:crypto";
+import {
+  publicEncrypt,
+  constants,
+  randomUUID,
+  randomBytes,
+  createHash
+} from "node:crypto";
 
-const VERSION = "1.1.0";
+const VERSION = "1.2.0";
 const BASE_URL = "https://lsa.lenovo.com";
 const API_URL = BASE_URL + "/Interface";
 const USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
@@ -21,7 +37,8 @@ const session = {
   guid: randomUUID(),
   clientUuid: randomUUID(),
   jwt: process.env.MFD_JWT || "",
-  rsaPublicKey: ""
+  rsaPublicKey: "",
+  oauthState: ""
 };
 const cookieJar = new Map();
 
@@ -159,8 +176,6 @@ function checkAuthFailure(status, data) {
     (typeof data?.msg === "string" && /token|auth|session|expired|unauthorized/i.test(data.msg));
 
   if (isAuthHttp || isAuthBodyCode) {
-    console.error("\n[!] Authentication Error: Your session token is invalid or has expired.");
-    console.error("[!] Please run 'mfd login' (or 'node mfd-cli.mjs login') to authenticate again.\n");
     return true;
   }
   return false;
@@ -271,24 +286,79 @@ function openBrowser(targetUrl) {
   } catch {}
 }
 
-function extractToken(rawInput) {
+/**
+ * Exchanges OAuth authorization code for full session JWT token
+ */
+async function exchangeOAuthCode(code, state) {
+  const reqState = state || session.oauthState || "";
+  const endpoint = `/user/oauth2/callback.jhtml?code=${encodeURIComponent(code)}&state=${encodeURIComponent(reqState)}&scope=openid`;
+
+  try {
+    const r = await apiRequest(endpoint, {}, { method: "GET", withoutAuth: true });
+    const text = await r.text();
+
+    // Check for Authorization= in text or JSON
+    const m = text.match(/(?:Authorization|token)=([^&\s"<>]+)/i);
+    if (m?.[1]) {
+      return decodeURIComponent(m[1]).trim();
+    }
+
+    try {
+      const json = JSON.parse(text);
+      const proto = json?.content || json?.msg || json?.desc || "";
+      const m2 = proto.match(/(?:Authorization|token)=([^&\s"<>]+)/i);
+      if (m2?.[1]) {
+        return decodeURIComponent(m2[1]).trim();
+      }
+    } catch {}
+  } catch (err) {
+    console.warn("[!] Warning: OAuth exchange request failed:", err.message);
+  }
+  return null;
+}
+
+/**
+ * Extracts and resolves token from user input (supports URL, Code, or raw Token)
+ */
+async function resolveTokenInput(rawInput) {
   if (!rawInput || typeof rawInput !== "string") return null;
   let input = rawInput.trim().replace(/^["']|["']$/g, "");
 
-  const m = input.match(/(?:Authorization|token|auth)=([^&\s"<>]+)/i);
-  if (m?.[1]) {
-    let raw = m[1].trim();
+  // 1. Direct Authorization token inside URI or string
+  const mAuth = input.match(/(?:Authorization|auth)=([^&\s"<>]+)/i);
+  if (mAuth?.[1]) {
+    let token = decodeURIComponent(mAuth[1]).trim();
+    if (token.startsWith("Bearer ")) token = token.slice(7).trim();
+    return token;
+  }
+
+  // 2. OAuth Code inside URL: lenovoIdSuccess.html?code=...
+  if (input.includes("code=") || input.includes("lenovoIdSuccess.html")) {
     try {
-      raw = decodeURIComponent(raw);
+      const parsedUrl = new URL(input.startsWith("http") ? input : `http://localhost?${input}`);
+      const code = parsedUrl.searchParams.get("code");
+      const state = parsedUrl.searchParams.get("state") || session.oauthState;
+      if (code) {
+        console.log("[i] Detected OAuth authorization code. Exchanging for session token...");
+        const exchanged = await exchangeOAuthCode(code, state);
+        if (exchanged) return exchanged;
+      }
     } catch {}
-    if (raw.startsWith("Bearer ")) raw = raw.slice(7).trim();
-    return raw;
   }
 
+  // 3. Raw 64-char Hex OAuth code (often copied directly from address bar query)
+  if (/^[a-fA-F0-9]{64}$/.test(input)) {
+    console.log("[i] Detected 64-char OAuth authorization code. Exchanging with backend...");
+    const exchanged = await exchangeOAuthCode(input, session.oauthState);
+    if (exchanged) return exchanged;
+  }
+
+  // 4. Plain Bearer token
   if (input.startsWith("Bearer ")) {
-    input = input.slice(7).trim();
+    return input.slice(7).trim();
   }
 
+  // 5. Raw JWT or session identifier (alphanumeric with dots, dashes, underscores)
   if (/^[a-zA-Z0-9_.-]{16,4096}$/.test(input)) {
     return input;
   }
@@ -296,28 +366,203 @@ function extractToken(rawInput) {
   return null;
 }
 
-async function downloadFile(url, destinationPath) {
+/**
+ * Verify ZIP file structural integrity by reading the End of Central Directory (EOCD)
+ */
+async function verifyZipStructure(filePath) {
+  try {
+    const fileStat = statSync(filePath);
+    if (fileStat.size < 22) return false;
+
+    const readSize = Math.min(fileStat.size, 65536);
+    const buffer = Buffer.alloc(readSize);
+    const fh = await open(filePath, "r");
+    await fh.read(buffer, 0, readSize, fileStat.size - readSize);
+    await fh.close();
+
+    const eocdSignature = Buffer.from([0x50, 0x4b, 0x05, 0x06]);
+    const idx = buffer.lastIndexOf(eocdSignature);
+    return idx !== -1;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Multi-threaded / Segmented Parallel Downloader with Progress Bar
+ */
+async function downloadFileParallel(url, destinationPath, options = {}) {
+  const { threads = 4, label = "Downloading" } = options;
+
+  let headRes;
+  try {
+    headRes = await fetch(url, { method: "HEAD" });
+  } catch {
+    headRes = null;
+  }
+
+  const contentLength = Number(headRes?.headers?.get("content-length")) || 0;
+  const acceptRanges = headRes?.headers?.get("accept-ranges") === "bytes";
+  const s3Etag = headRes?.headers?.get("etag")?.replace(/["']/g, "") || "";
+
+  // If file is small (< 15MB) or server doesn't support ranges, use standard stream
+  if (!acceptRanges || contentLength < 15 * 1024 * 1024 || threads <= 1) {
+    return downloadFileSingleStream(url, destinationPath, { label, s3Etag, contentLength });
+  }
+
+  const numThreads = Math.min(threads, 8);
+  const chunkSize = Math.floor(contentLength / numThreads);
+  const fileHandle = await open(destinationPath, "w");
+  // Pre-allocate file size
+  await fileHandle.truncate(contentLength);
+
+  let totalReceived = 0;
+  let lastReceived = 0;
+  let lastTime = Date.now();
+  let currentSpeedMBps = "0.00";
+
+  const progressInterval = setInterval(() => {
+    const now = Date.now();
+    const timeDelta = (now - lastTime) / 1000;
+    if (timeDelta >= 0.5) {
+      const bytesDelta = totalReceived - lastReceived;
+      currentSpeedMBps = (bytesDelta / (1024 * 1024 * timeDelta)).toFixed(2);
+      lastReceived = totalReceived;
+      lastTime = now;
+    }
+
+    if (process.stdout.isTTY) {
+      const pct = ((totalReceived / contentLength) * 100).toFixed(1);
+      const recMB = (totalReceived / (1024 * 1024)).toFixed(1);
+      const totMB = (contentLength / (1024 * 1024)).toFixed(1);
+      process.stdout.write(`\r${label} [${numThreads} threads]: ${pct}% [${recMB}MB / ${totMB}MB] @ ${currentSpeedMBps} MB/s `);
+    }
+  }, 250);
+
+  try {
+    const chunkPromises = [];
+
+    for (let i = 0; i < numThreads; i++) {
+      const start = i * chunkSize;
+      const end = i === numThreads - 1 ? contentLength - 1 : (i + 1) * chunkSize - 1;
+
+      chunkPromises.push((async () => {
+        const res = await fetch(url, {
+          headers: { Range: `bytes=${start}-${end}` }
+        });
+
+        if (!res.ok && res.status !== 206) {
+          throw new Error(`Thread ${i + 1} failed: HTTP ${res.status}`);
+        }
+
+        let writeOffset = start;
+        const reader = res.body.getReader();
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          const chunkLen = value.length;
+          await fileHandle.write(value, 0, chunkLen, writeOffset);
+          writeOffset += chunkLen;
+          totalReceived += chunkLen;
+        }
+      })());
+    }
+
+    await Promise.all(chunkPromises);
+  } finally {
+    clearInterval(progressInterval);
+    await fileHandle.close();
+    if (process.stdout.isTTY) process.stdout.write("\n");
+  }
+
+  // Integrity checks
+  await verifyFileIntegrity(destinationPath, s3Etag);
+}
+
+/**
+ * Fallback Single-Stream Downloader
+ */
+async function downloadFileSingleStream(url, destinationPath, options = {}) {
+  const { label = "Downloading", s3Etag = "", contentLength = 0 } = options;
+
   const res = await fetch(url);
   if (!res.ok) throw new Error(`Download failed with status ${res.status}: ${res.statusText}`);
-  const total = Number(res.headers.get("content-length")) || 0;
+
+  const total = Number(res.headers.get("content-length")) || contentLength || 0;
+  const effectiveEtag = s3Etag || res.headers.get("etag")?.replace(/["']/g, "") || "";
   let received = 0;
+  let lastReceived = 0;
+  let lastTime = Date.now();
+  let currentSpeedMBps = "0.00";
 
   const nodeReadable = Readable.fromWeb(res.body);
+  const hash = createHash("md5");
+
   nodeReadable.on("data", (chunk) => {
     received += chunk.length;
+    hash.update(chunk);
+
+    const now = Date.now();
+    const timeDelta = (now - lastTime) / 1000;
+    if (timeDelta >= 0.5) {
+      const bytesDelta = received - lastReceived;
+      currentSpeedMBps = (bytesDelta / (1024 * 1024 * timeDelta)).toFixed(2);
+      lastReceived = received;
+      lastTime = now;
+    }
+
     if (total > 0 && process.stdout.isTTY) {
       const pct = ((received / total) * 100).toFixed(1);
       const mbRec = (received / 1048576).toFixed(1);
       const mbTot = (total / 1048576).toFixed(1);
-      process.stdout.write(`\rDownloading: ${pct}% [${mbRec}MB / ${mbTot}MB]`);
+      process.stdout.write(`\r${label}: ${pct}% [${mbRec}MB / ${mbTot}MB] @ ${currentSpeedMBps} MB/s `);
     }
   });
 
   const fileStream = createWriteStream(destinationPath);
   await pipeline(nodeReadable, fileStream);
   if (process.stdout.isTTY) process.stdout.write("\n");
+
+  const calculatedMd5 = hash.digest("hex");
+  await verifyFileIntegrity(destinationPath, effectiveEtag, calculatedMd5);
 }
 
+/**
+ * Common Integrity Verification Routine
+ */
+async function verifyFileIntegrity(filePath, s3Etag = "", calculatedMd5 = "") {
+  console.log("[i] Verifying downloaded package integrity...");
+
+  const isZip = filePath.endsWith(".zip");
+  if (isZip) {
+    const zipOk = await verifyZipStructure(filePath);
+    if (zipOk) {
+      console.log("    [✓] ZIP archive structural test: PASSED");
+    } else {
+      console.warn("    [!] WARNING: ZIP structural check failed. Archive may be incomplete.");
+    }
+  }
+
+  // AWS S3 single-part ETag is standard MD5
+  if (s3Etag && !s3Etag.includes("-")) {
+    let md5 = calculatedMd5;
+    if (!md5) {
+      const fileData = readFileSync(filePath);
+      md5 = createHash("md5").update(fileData).digest("hex");
+    }
+
+    if (md5.toLowerCase() === s3Etag.toLowerCase()) {
+      console.log(`    [✓] MD5/ETag checksum match: PASSED (${md5})`);
+    } else {
+      console.warn(`    [!] Checksum mismatch: (Local: ${md5} vs Remote: ${s3Etag})`);
+    }
+  }
+}
+
+/**
+ * Authentication Flow
+ */
 async function login() {
   if (session.jwt) {
     console.log("Notice: An active session is currently saved in", STATE_FILE);
@@ -335,6 +580,7 @@ async function login() {
 
   const rawLoginUrl = await getLoginUrl();
   const loginUrl = new URL(rawLoginUrl);
+  session.oauthState = loginUrl.searchParams.get("state") || "";
   loginUrl.searchParams.set("redirect_uri", "https://lsa.lenovo.com/Tips/lenovoIdSuccess.html");
 
   console.log("=======================================================");
@@ -342,8 +588,8 @@ async function login() {
   console.log("=======================================================");
   console.log("1. Open this URL in your web browser:\n");
   console.log(loginUrl.toString());
-  console.log("\n2. Log in with your Motorola account.");
-  console.log("3. When redirection completes, copy the full URL from your address bar (or the Authorization parameter value).");
+  console.log("\n2. Sign in with your Motorola account.");
+  console.log("3. Copy the URL from your address bar (or the authorization code) and paste it below.");
   console.log("=======================================================\n");
 
   openBrowser(loginUrl.toString());
@@ -360,11 +606,11 @@ async function login() {
   process.once("SIGINT", handleSigint);
 
   try {
-    const input = await rl.question("Paste the redirect URL or Authorization token here: ", { signal: ac.signal });
-    const token = extractToken(input);
+    const input = await rl.question("Paste redirect URL or Authorization code here: ", { signal: ac.signal });
+    const token = await resolveTokenInput(input);
 
     if (!token) {
-      console.error("\nError: Could not extract a valid Authorization token from the provided input.");
+      console.error("\nError: Could not extract a valid Authorization token from the input.");
       process.exit(1);
     }
 
@@ -377,8 +623,71 @@ async function login() {
   }
 }
 
+/**
+ * Query firmware with specific carrier
+ */
+async function queryFirmwareByCarrier(modelName, imei, carrier) {
+  const encryptCode = randomBytes(4).toString("hex").toUpperCase();
+  const r = await apiRequest("/rescueDevice/getNewResourceByImei.jhtml", {
+    imei,
+    modelCode: modelName,
+    roCarrier: carrier,
+    encryptCode,
+    sku: modelName,
+    carrierSku: modelName
+  });
+
+  const data = await parseJsonResponse(r);
+  if (checkAuthFailure(r.status, data)) {
+    throw new Error("AUTH_EXPIRED");
+  }
+
+  if (data?.code === "0000" && Array.isArray(data?.content) && data.content.length > 0) {
+    return data.content[0];
+  }
+  return null;
+}
+
+/**
+ * Discovers available firmwares across multiple software channels
+ */
+async function discoverAvailableFirmwares(modelName, imei, customCarriers = []) {
+  const defaultCarriers = ["retla", "reteu", "retus", "retbr", "retin", "att", "vzw", "tmo", "altmx"];
+  const carriersToQuery = [...new Set([...customCarriers, ...defaultCarriers])];
+
+  console.log(`\n[i] Querying Motorola firmware catalog for model: ${modelName} | IMEI: ${imei}...`);
+
+  const results = [];
+  const seenUris = new Set();
+
+  const promises = carriersToQuery.map(async (carrier) => {
+    try {
+      const item = await queryFirmwareByCarrier(modelName, imei, carrier);
+      if (item && item.romResource?.uri && !seenUris.has(item.romResource.uri)) {
+        seenUris.add(item.romResource.uri);
+        results.push(item);
+      }
+    } catch (err) {
+      if (err.message === "AUTH_EXPIRED") throw err;
+    }
+  });
+
+  await Promise.all(promises);
+  return results;
+}
+
+/**
+ * Search and Download by IMEI (Manual CLI entry point)
+ */
 async function searchByImei(modelName, imei, options = {}) {
-  const { carrier = "retla", json = false, urlsOnly = false, download = false } = options;
+  const {
+    carrier = "retla",
+    json = false,
+    urlsOnly = false,
+    download = false,
+    outputDir = process.cwd(),
+    threads = 4
+  } = options;
 
   if (!session.jwt) {
     console.error("Error: No active session found. Please run 'mfd login' or set MFD_JWT.");
@@ -393,50 +702,28 @@ async function searchByImei(modelName, imei, options = {}) {
     console.log(`\nFetching firmware for model: ${modelName} | IMEI: ${imei} | Carrier: ${carrier}...`);
   }
 
-  const encryptCode = randomBytes(4).toString("hex").toUpperCase();
-
-  let r;
+  let item;
   try {
-    r = await apiRequest("/rescueDevice/getNewResourceByImei.jhtml", {
-      imei,
-      modelCode: modelName,
-      roCarrier: carrier,
-      encryptCode,
-      sku: modelName,
-      carrierSku: modelName
-    });
+    item = await queryFirmwareByCarrier(modelName, imei, carrier);
   } catch (err) {
+    if (err.message === "AUTH_EXPIRED") {
+      console.error("\n[!] Authentication Error: Your session token is invalid or has expired.");
+      console.error("[!] Please run 'mfd login' to authenticate again.\n");
+      process.exit(1);
+    }
     console.error("[!] Request failed:", err.message);
     process.exit(1);
   }
 
-  let data;
-  try {
-    data = await parseJsonResponse(r);
-  } catch (err) {
-    console.error(`[!] API Error: ${err.message}`);
-    process.exit(1);
-  }
-
-  if (checkAuthFailure(r.status, data)) {
-    process.exit(1);
-  }
-
-  if (!r.ok) {
-    console.error(`[!] API returned HTTP ${r.status} ${r.statusText}:`, JSON.stringify(data, null, 2));
-    process.exit(1);
-  }
-
-  if (data?.code !== "0000" || !Array.isArray(data?.content) || data.content.length === 0) {
+  if (!item) {
     if (json) {
-      console.error(JSON.stringify(data, null, 2));
+      console.error(JSON.stringify({ error: "No firmware found for specified carrier" }, null, 2));
     } else {
-      console.error("API response error:", JSON.stringify(data, null, 2));
+      console.error(`[!] No firmware found for model '${modelName}' under carrier '${carrier}'.`);
+      console.error("[!] Try specifying a different carrier (e.g. --carrier reteu, retus, retbr).");
     }
     process.exit(1);
   }
-
-  const item = data.content[0] || {};
 
   if (json) {
     console.log(JSON.stringify(item, null, 2));
@@ -451,8 +738,17 @@ async function searchByImei(modelName, imei, options = {}) {
     return;
   }
 
+  displayFirmwareDetails(item);
+  saveState();
+
+  if (download) {
+    await executeDownloadPipeline(item, outputDir, threads);
+  }
+}
+
+function displayFirmwareDetails(item) {
   console.log("\n=======================================================");
-  console.log("FIRMWARE DETAILS AND DOWNLOAD LINKS");
+  console.log("FIRMWARE DETAILS & OFFICIAL AWS S3 LINKS");
   console.log("=======================================================");
   console.log(`Device:         ${item.marketName || "N/A"} (${item.modelName || "N/A"})`);
   console.log(`Carrier:        ${item.carrier || "N/A"}`);
@@ -461,33 +757,218 @@ async function searchByImei(modelName, imei, options = {}) {
   console.log(`Flash Mode:     ${item.fastboot ? "Fastboot" : "BROM/EDL"}`);
   console.log("-------------------------------------------------------");
   if (item.romResource && typeof item.romResource === "object") {
-    console.log(`ROM ZIP:        ${item.romResource.name || "N/A"}`);
+    console.log(`ROM Package:    ${item.romResource.name || "N/A"}`);
     console.log(`Publish Date:   ${item.romResource.publishDate || "N/A"}`);
     console.log(`ROM Link (S3):  ${item.romResource.uri || "N/A"}\n`);
   }
   if (item.toolResource && typeof item.toolResource === "object") {
-    console.log(`Tool ZIP:       ${item.toolResource.name || "N/A"}`);
+    console.log(`Tool Package:   ${item.toolResource.name || "N/A"}`);
     console.log(`Tool Link (S3): ${item.toolResource.uri || "N/A"}\n`);
   }
   if (item.flashFlow) {
     console.log(`Flash Flow:     ${item.flashFlow}\n`);
   }
   console.log("=======================================================");
-  saveState();
+}
 
-  if (download) {
-    if (item.romResource?.uri) {
-      const fileName = item.romResource.name || basename(new URL(item.romResource.uri).pathname) || "rom.zip";
-      console.log(`\nStarting download for ${fileName}...`);
-      await downloadFile(item.romResource.uri, join(process.cwd(), fileName));
-      console.log(`Saved: ${fileName}`);
+async function executeDownloadPipeline(item, outputDir, threads = 4) {
+  const targetDir = resolve(outputDir || process.cwd());
+
+  const downloads = [];
+
+  if (item.romResource?.uri) {
+    const romFileName = item.romResource.name || basename(new URL(item.romResource.uri).pathname) || "rom.zip";
+    const romDestPath = join(targetDir, romFileName);
+    downloads.push({
+      uri: item.romResource.uri,
+      dest: romDestPath,
+      name: romFileName,
+      label: "Downloading ROM"
+    });
+  }
+
+  if (item.toolResource?.uri) {
+    const toolFileName = item.toolResource.name || basename(new URL(item.toolResource.uri).pathname) || "tool.zip";
+    const toolDestPath = join(targetDir, toolFileName);
+    downloads.push({
+      uri: item.toolResource.uri,
+      dest: toolDestPath,
+      name: toolFileName,
+      label: "Downloading Tools"
+    });
+  }
+
+  console.log(`\nStarting accelerated parallel download into: ${targetDir}`);
+
+  for (const dl of downloads) {
+    console.log(`\n-> Package: ${dl.name}`);
+    await downloadFileParallel(dl.uri, dl.dest, { threads, label: dl.label });
+
+    const fileStat = statSync(dl.dest);
+    const sizeMB = (fileStat.size / (1024 * 1024)).toFixed(2);
+    const sizeGB = (fileStat.size / (1024 * 1024 * 1024)).toFixed(2);
+
+    console.log("=======================================================");
+    console.log("[✓] DOWNLOAD SAVED SUCCESSFULLY");
+    console.log(`    File:     ${dl.name}`);
+    console.log(`    Size:     ${fileStat.size > 1073741824 ? `${sizeGB} GB` : `${sizeMB} MB`} (${fileStat.size.toLocaleString()} bytes)`);
+    console.log(`    Saved At: ${dl.dest}`);
+    console.log("=======================================================");
+  }
+}
+
+/**
+ * Interactive Step-by-Step Wizard (All-in-One Entry Point)
+ */
+async function runInteractiveWizard() {
+  console.log("========================================================================");
+  console.log(` Moto Firmware Downloader (MFD) v${VERSION} - Interactive Wizard`);
+  console.log("========================================================================");
+
+  // 1. Session verification
+  if (!session.jwt) {
+    console.log("\n[!] No active session found. Initiating authentication...");
+    await login();
+  }
+
+  if (!session.rsaPublicKey) {
+    await fetchRsaKey();
+  }
+
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  const ac = new AbortController();
+
+  const handleSigint = () => {
+    ac.abort();
+    rl.close();
+    process.stdout.write("\n\nWizard cancelled by user.\n");
+    process.exit(130);
+  };
+  process.once("SIGINT", handleSigint);
+
+  try {
+    // 2. Input Device Model
+    let model = "";
+    while (!model) {
+      const resp = await rl.question("\n[1/4] Enter Device Model (e.g. XT2415-1, XT2435-1): ", { signal: ac.signal });
+      model = resp.trim().toUpperCase();
+      if (!model) console.log("Model code is required.");
     }
-    if (item.toolResource?.uri) {
-      const toolName = item.toolResource.name || basename(new URL(item.toolResource.uri).pathname) || "tool.zip";
-      console.log(`\nStarting download for ${toolName}...`);
-      await downloadFile(item.toolResource.uri, join(process.cwd(), toolName));
-      console.log(`Saved: ${toolName}`);
+
+    // 3. Input IMEI
+    let imei = "";
+    while (!imei) {
+      const resp = await rl.question("[2/4] Enter Device IMEI (14-15 digits): ", { signal: ac.signal });
+      imei = resp.trim().replace(/\D/g, "");
+      if (imei.length < 14 || imei.length > 16) {
+        console.log("Invalid IMEI length. Please enter a valid 14-15 digit IMEI.");
+        imei = "";
+      }
     }
+
+    // 4. Discovery & Selection
+    let firmwares = [];
+    try {
+      firmwares = await discoverAvailableFirmwares(model, imei);
+    } catch (err) {
+      if (err.message === "AUTH_EXPIRED") {
+        console.error("\n[!] Authentication expired. Re-authenticating...");
+        await login();
+        firmwares = await discoverAvailableFirmwares(model, imei);
+      } else {
+        throw err;
+      }
+    }
+
+    if (firmwares.length === 0) {
+      console.log(`\n[!] No official firmwares automatically matched for model '${model}'.`);
+      const customCarrier = await rl.question("Enter a specific carrier channel to query (e.g. retla, reteu): ", { signal: ac.signal });
+      if (customCarrier.trim()) {
+        const item = await queryFirmwareByCarrier(model, imei, customCarrier.trim());
+        if (item) firmwares.push(item);
+      }
+    }
+
+    if (firmwares.length === 0) {
+      console.error("\n[!] Could not locate firmware for this device. Please verify your Model and IMEI.");
+      return;
+    }
+
+    // Display Available Variants
+    console.log("\n========================================================================");
+    console.log(`AVAILABLE OFFICIAL FIRMWARE RELEASES FOR ${model}:`);
+    console.log("========================================================================");
+
+    firmwares.forEach((fw, idx) => {
+      console.log(`[${idx + 1}] Region / Carrier:  ${(fw.carrier || "DEFAULT").toUpperCase()}`);
+      console.log(`    Market Name:        ${fw.marketName || "N/A"}`);
+      console.log(`    Build Fingerprint:  ${fw.fingerPrint || "N/A"}`);
+      console.log(`    ROM Package:        ${fw.romResource?.name || "N/A"}`);
+      console.log(`    Publish Date:       ${fw.romResource?.publishDate || "N/A"}`);
+      console.log(`    Flash Mode:         ${fw.fastboot ? "Fastboot" : "BROM/EDL"}`);
+      console.log("------------------------------------------------------------------------");
+    });
+    console.log("[0] Exit");
+    console.log("========================================================================");
+
+    let selectedIndex = -1;
+    while (selectedIndex < 0 || selectedIndex > firmwares.length) {
+      const choice = await rl.question(`Select firmware package to use [1-${firmwares.length}]: `, { signal: ac.signal });
+      const num = parseInt(choice.trim(), 10);
+      if (num === 0) {
+        console.log("Operation cancelled.");
+        return;
+      }
+      if (!isNaN(num) && num >= 1 && num <= firmwares.length) {
+        selectedIndex = num - 1;
+      }
+    }
+
+    const selectedFirmware = firmwares[selectedIndex];
+
+    // 5. Choose Action
+    console.log("\n[3/4] Choose Action:");
+    console.log("  1) High-Speed Multi-Threaded Download (Parallel Segments) [Recommended]");
+    console.log("  2) Standard Single-Stream Download");
+    console.log("  3) Display Direct AWS S3 Download Links");
+    console.log("  4) Save Download Links to text file");
+
+    let actionChoice = "";
+    while (!["1", "2", "3", "4"].includes(actionChoice)) {
+      actionChoice = (await rl.question("Select action [1-4] (default: 1): ", { signal: ac.signal })).trim() || "1";
+    }
+
+    if (actionChoice === "3") {
+      displayFirmwareDetails(selectedFirmware);
+      return;
+    }
+
+    if (actionChoice === "4") {
+      const txtFile = join(process.cwd(), `links_${model}_${selectedFirmware.carrier || "fw"}.txt`);
+      const content = [
+        `Device: ${selectedFirmware.marketName} (${selectedFirmware.modelName})`,
+        `Carrier: ${selectedFirmware.carrier}`,
+        `Fingerprint: ${selectedFirmware.fingerPrint}`,
+        `ROM Link: ${selectedFirmware.romResource?.uri || "N/A"}`,
+        `Tool Link: ${selectedFirmware.toolResource?.uri || "N/A"}`
+      ].join("\n");
+
+      writeFileSync(txtFile, content, "utf8");
+      console.log(`\n[✓] Links successfully exported to: ${resolve(txtFile)}`);
+      return;
+    }
+
+    // 6. Output directory
+    const outputPrompt = await rl.question(`\n[4/4] Output directory [default: ${process.cwd()}]: `, { signal: ac.signal });
+    const targetDir = outputPrompt.trim() ? resolve(outputPrompt.trim()) : process.cwd();
+
+    // Execute Download
+    const threads = actionChoice === "1" ? 4 : 1;
+    await executeDownloadPipeline(selectedFirmware, targetDir, threads);
+
+  } finally {
+    process.removeListener("SIGINT", handleSigint);
+    rl.close();
   }
 }
 
@@ -521,6 +1002,8 @@ async function searchParameters(modelName, json = false) {
   }
 
   if (checkAuthFailure(r.status, data)) {
+    console.error("\n[!] Authentication Error: Your session token is invalid or has expired.");
+    console.error("[!] Please run 'mfd login' to authenticate again.\n");
     process.exit(1);
   }
 
@@ -539,12 +1022,15 @@ async function searchParameters(modelName, json = false) {
 function showHelp() {
   console.log(`Moto Firmware Downloader (MFD) v${VERSION}`);
   console.log("\nUsage:");
-  console.log("  mfd login");
-  console.log("  mfd imei <Model> <IMEI> [options]");
-  console.log("  mfd search <Model> [--json]");
+  console.log("  mfd                                  Launch interactive guided wizard");
+  console.log("  mfd login                            Authenticate with Motorola account");
+  console.log("  mfd imei <Model> <IMEI> [options]    Lookup and download firmware for a device");
+  console.log("  mfd search <Model> [--json]          Query required device match parameters");
   console.log("\nOptions for 'imei':");
   console.log("  -c, --carrier <Carrier>   Carrier code (default: retla)");
-  console.log("  -d, --download            Directly download ROM & Tool ZIP files to current directory");
+  console.log("  -d, --download            Directly download ROM & Tool ZIP files");
+  console.log("  -o, --output <Directory>  Output directory for downloaded files");
+  console.log("  -t, --threads <Number>    Number of parallel download threads (default: 4)");
   console.log("      --json                Output result in JSON format (scripting friendly)");
   console.log("      --urls-only           Print only direct downloadable S3 URLs (one per line)");
   console.log("\nGeneral Options:");
@@ -554,7 +1040,7 @@ function showHelp() {
 
 function parseCliArgs(argv) {
   const args = argv.slice(2);
-  if (args.length === 0 || args.includes("-h") || args.includes("--help")) {
+  if (args.includes("-h") || args.includes("--help")) {
     showHelp();
     process.exit(0);
   }
@@ -562,6 +1048,10 @@ function parseCliArgs(argv) {
   if (args.includes("-v") || args.includes("--version")) {
     console.log(`v${VERSION}`);
     process.exit(0);
+  }
+
+  if (args.length === 0 || args[0] === "wizard") {
+    return { command: "wizard" };
   }
 
   const command = args[0];
@@ -586,6 +1076,8 @@ function parseCliArgs(argv) {
     let json = false;
     let urlsOnly = false;
     let download = false;
+    let outputDir = process.cwd();
+    let threads = 4;
     const positional = [];
 
     for (let i = 0; i < rest.length; i++) {
@@ -596,6 +1088,18 @@ function parseCliArgs(argv) {
           process.exit(1);
         }
         carrier = rest[++i];
+      } else if (arg === "-o" || arg === "--output") {
+        if (!rest[i + 1] || rest[i + 1].startsWith("-")) {
+          console.error("Error: --output requires a directory path.");
+          process.exit(1);
+        }
+        outputDir = rest[++i];
+      } else if (arg === "-t" || arg === "--threads") {
+        if (!rest[i + 1] || isNaN(parseInt(rest[i + 1], 10))) {
+          console.error("Error: --threads requires a number.");
+          process.exit(1);
+        }
+        threads = parseInt(rest[++i], 10);
       } else if (arg === "--json") {
         json = true;
       } else if (arg === "--urls-only") {
@@ -612,11 +1116,11 @@ function parseCliArgs(argv) {
 
     if (positional.length < 2) {
       console.error("Error: Missing required arguments <Model> and <IMEI>.");
-      console.error("Usage: mfd imei <Model> <IMEI> [--carrier <Carrier>] [--download] [--json] [--urls-only]");
+      console.error("Usage: mfd imei <Model> <IMEI> [--carrier <Carrier>] [--download] [-o <Dir>] [--json] [--urls-only]");
       process.exit(1);
     }
 
-    return { command, model: positional[0], imei: positional[1], carrier, json, urlsOnly, download };
+    return { command, model: positional[0], imei: positional[1], carrier, json, urlsOnly, download, outputDir, threads };
   }
 
   console.error(`Error: Unknown command '${command}'.`);
@@ -627,14 +1131,18 @@ function parseCliArgs(argv) {
 loadState();
 const parsed = parseCliArgs(process.argv);
 
-if (parsed.command === "login") {
+if (parsed.command === "wizard") {
+  await runInteractiveWizard();
+} else if (parsed.command === "login") {
   await login();
 } else if (parsed.command === "imei") {
   await searchByImei(parsed.model, parsed.imei, {
     carrier: parsed.carrier,
     json: parsed.json,
     urlsOnly: parsed.urlsOnly,
-    download: parsed.download
+    download: parsed.download,
+    outputDir: parsed.outputDir,
+    threads: parsed.threads
   });
 } else if (parsed.command === "search") {
   await searchParameters(parsed.model, parsed.json);
