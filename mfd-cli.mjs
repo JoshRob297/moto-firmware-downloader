@@ -25,7 +25,7 @@ import {
   createHash
 } from "node:crypto";
 
-const VERSION = "1.2.1";
+const VERSION = "1.2.2";
 const BASE_URL = "https://lsa.lenovo.com";
 const API_URL = BASE_URL + "/Interface";
 const USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
@@ -287,6 +287,21 @@ function openBrowser(targetUrl) {
 }
 
 /**
+ * Strict check if a string is a valid JWT token
+ */
+function isJwt(str) {
+  if (typeof str !== "string") return false;
+  const trimmed = str.trim();
+  const parts = trimmed.split(".");
+  return (
+    parts.length === 3 &&
+    parts[0].startsWith("eyJ") &&
+    /^[A-Za-z0-9_-]+$/.test(parts[0]) &&
+    /^[A-Za-z0-9_-]+$/.test(parts[1])
+  );
+}
+
+/**
  * Exchanges OAuth authorization code for full session JWT token
  */
 async function exchangeOAuthCode(code, state) {
@@ -300,7 +315,9 @@ async function exchangeOAuthCode(code, state) {
     // Check for Authorization= in text or JSON
     const m = text.match(/(?:Authorization|token)=([^&\s"<>]+)/i);
     if (m?.[1]) {
-      return decodeURIComponent(m[1]).trim();
+      let candidate = decodeURIComponent(m[1]).trim();
+      if (candidate.startsWith("Bearer ")) candidate = candidate.slice(7).trim();
+      if (isJwt(candidate)) return candidate;
     }
 
     try {
@@ -308,7 +325,9 @@ async function exchangeOAuthCode(code, state) {
       const proto = json?.content || json?.msg || json?.desc || "";
       const m2 = proto.match(/(?:Authorization|token)=([^&\s"<>]+)/i);
       if (m2?.[1]) {
-        return decodeURIComponent(m2[1]).trim();
+        let candidate = decodeURIComponent(m2[1]).trim();
+        if (candidate.startsWith("Bearer ")) candidate = candidate.slice(7).trim();
+        if (isJwt(candidate)) return candidate;
       }
     } catch {}
   } catch (err) {
@@ -324,15 +343,26 @@ async function resolveTokenInput(rawInput) {
   if (!rawInput || typeof rawInput !== "string") return null;
   let input = rawInput.trim().replace(/^["']|["']$/g, "");
 
-  // 1. Direct Authorization token inside URI or string
-  const mAuth = input.match(/(?:Authorization|auth)=([^&\s"<>]+)/i);
+  // 1. Direct Authorization token inside URI or string (e.g. softwareFix://authcallback?Authorization=eyJ...)
+  const mAuth = input.match(/(?:Authorization|auth|token)=([^&\s"<>]+)/i);
   if (mAuth?.[1]) {
     let token = decodeURIComponent(mAuth[1]).trim();
     if (token.startsWith("Bearer ")) token = token.slice(7).trim();
-    return token;
+    if (isJwt(token)) return token;
   }
 
-  // 2. OAuth Code inside URL: lenovoIdSuccess.html?code=...
+  // 2. Plain Bearer token
+  if (input.startsWith("Bearer ")) {
+    const token = input.slice(7).trim();
+    if (isJwt(token)) return token;
+  }
+
+  // 3. Raw JWT token directly pasted
+  if (isJwt(input)) {
+    return input;
+  }
+
+  // 4. OAuth Code inside URL: lenovoIdSuccess.html?code=...
   if (input.includes("code=") || input.includes("lenovoIdSuccess.html")) {
     try {
       const parsedUrl = new URL(input.startsWith("http") ? input : `http://localhost?${input}`);
@@ -342,25 +372,25 @@ async function resolveTokenInput(rawInput) {
         console.log("[i] Detected OAuth authorization code. Exchanging for session token...");
         const exchanged = await exchangeOAuthCode(code, state);
         if (exchanged) return exchanged;
+        console.warn("\n[!] The authorization code could not be exchanged with the backend.");
+        console.warn("    (If the webpage already loaded, the browser consumed the one-time code).");
+        console.warn("    Tip: Copy the 'softwareFix://authcallback?Authorization=...' link from your address bar");
+        console.warn("    or open Developer Tools (F12) -> Application/Network -> copy the JWT Authorization token.\n");
+        return null;
       }
     } catch {}
   }
 
-  // 3. Raw 64-char Hex OAuth code (often copied directly from address bar query)
-  if (/^[a-fA-F0-9]{64}$/.test(input)) {
-    console.log("[i] Detected 64-char OAuth authorization code. Exchanging with backend...");
+  // 5. Raw 32 to 128-char Hex OAuth code
+  if (/^[a-fA-F0-9]{32,128}$/.test(input)) {
+    console.log("[i] Detected OAuth authorization code. Exchanging with backend...");
     const exchanged = await exchangeOAuthCode(input, session.oauthState);
     if (exchanged) return exchanged;
-  }
-
-  // 4. Plain Bearer token
-  if (input.startsWith("Bearer ")) {
-    return input.slice(7).trim();
-  }
-
-  // 5. Raw JWT or session identifier (alphanumeric with dots, dashes, underscores)
-  if (/^[a-zA-Z0-9_.-]{16,4096}$/.test(input)) {
-    return input;
+    console.warn("\n[!] The authorization code could not be exchanged with the backend.");
+    console.warn("    (If the webpage already loaded, the browser consumed the one-time code).");
+    console.warn("    Tip: Copy the 'softwareFix://authcallback?Authorization=...' link from your address bar");
+    console.warn("    or open Developer Tools (F12) -> Application/Network -> copy the JWT Authorization token.\n");
+    return null;
   }
 
   return null;
@@ -561,6 +591,26 @@ async function verifyFileIntegrity(filePath, s3Etag = "", calculatedMd5 = "") {
 }
 
 /**
+ * Live validation of JWT session token against Motorola/Lenovo backend
+ */
+async function validateTokenWithBackend(token) {
+  const originalJwt = session.jwt;
+  session.jwt = token;
+  try {
+    const r = await apiRequest("/query/matchParams.jhtml", { modelName: "XT2435-1" });
+    const data = await parseJsonResponse(r);
+    if (checkAuthFailure(r.status, data)) {
+      return false;
+    }
+    return r.ok;
+  } catch {
+    return false;
+  } finally {
+    session.jwt = originalJwt;
+  }
+}
+
+/**
  * Authentication Flow
  */
 async function login() {
@@ -588,8 +638,10 @@ async function login() {
   console.log("=======================================================");
   console.log("1. Open this URL in your web browser:\n");
   console.log(loginUrl.toString());
-  console.log("\n2. Sign in with your Motorola account.");
-  console.log("3. Copy the URL from your address bar (or the authorization code) and paste it below.");
+  console.log("\n2. Sign in with your Motorola / Lenovo account.");
+  console.log("3. Once logged in, your browser will redirect to a success page or prompt");
+  console.log("   to open 'softwareFix://authcallback?Authorization=...'");
+  console.log("4. Copy the 'softwareFix://...' link (or the full redirect URL) and paste it below.");
   console.log("=======================================================\n");
 
   openBrowser(loginUrl.toString());
@@ -606,17 +658,25 @@ async function login() {
   process.once("SIGINT", handleSigint);
 
   try {
-    const input = await rl.question("Paste redirect URL or Authorization code here: ", { signal: ac.signal });
+    const input = await rl.question("Paste redirect URL, softwareFix link, or JWT token: ", { signal: ac.signal });
     const token = await resolveTokenInput(input);
 
     if (!token) {
-      console.error("\nError: Could not extract a valid Authorization token from the input.");
+      console.error("\nError: Could not extract a valid JWT Authorization token from the input.");
+      console.error("Make sure to copy the entire 'softwareFix://authcallback?Authorization=...' URL or the direct JWT token.\n");
+      process.exit(1);
+    }
+
+    console.log("[i] Validating session with Motorola backend...");
+    const isValid = await validateTokenWithBackend(token);
+    if (!isValid) {
+      console.error("\nError: Token validation failed against Motorola server (token is invalid or expired).");
       process.exit(1);
     }
 
     session.jwt = token;
     saveState();
-    console.log("\nLogin successful! Session saved to", STATE_FILE);
+    console.log("\nLogin successful! Active session saved to", STATE_FILE);
   } finally {
     process.removeListener("SIGINT", handleSigint);
     rl.close();
