@@ -15,7 +15,7 @@
   ],
   "scripts": {
     "start": "node mfd-cli.mjs",
-    "test": "node --check mfd-cli.mjs && node --test test/*.test.mjs && node mfd-cli.mjs --help"
+    "test": "node --check mfd-cli.mjs && node --test && node mfd-cli.mjs --help"
   },
   "repository": {
     "type": "git",
