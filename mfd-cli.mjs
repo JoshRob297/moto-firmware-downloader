@@ -25,7 +25,7 @@ import {
   createHash
 } from "node:crypto";
 
-const VERSION = "1.2.3";
+const VERSION = "1.2.4";
 const BASE_URL = "https://lsa.lenovo.com";
 const API_URL = BASE_URL + "/Interface";
 const USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
@@ -605,7 +605,8 @@ async function verifyFileIntegrity(filePath, s3Etag = "", calculatedMd5 = "") {
 }
 
 /**
- * Live validation of JWT session token against Motorola/Lenovo backend
+ * Live validation of session token against Motorola/Lenovo backend.
+ * Returns { valid: boolean, reason?: string, status?: number, code?: string }
  */
 async function validateTokenWithBackend(token) {
   const originalJwt = session.jwt;
@@ -613,55 +614,29 @@ async function validateTokenWithBackend(token) {
   try {
     const r = await apiRequest("/query/matchParams.jhtml", { modelName: "XT2435-1" });
     const data = await parseJsonResponse(r);
-    if (checkAuthFailure(r.status, data)) {
-      return false;
+    const isFailure = checkAuthFailure(r.status, data);
+
+    if (isFailure) {
+      const reason = data?.desc || data?.msg || `HTTP ${r.status}`;
+      return { valid: false, reason, status: r.status, code: data?.code };
     }
-    return r.ok;
-  } catch {
-    return false;
+
+    return { valid: r.ok, status: r.status, code: data?.code };
+  } catch (err) {
+    return { valid: false, reason: err.message };
   } finally {
     session.jwt = originalJwt;
   }
 }
 
 /**
- * Authentication Flow
+ * Authentication Flow with Interactive Retry and Fresh Session Generation
  */
 async function login() {
   if (session.jwt) {
     console.log("Notice: An active session is currently saved in", STATE_FILE);
     console.log("Proceeding with login will overwrite the existing token.\n");
   }
-
-  try {
-    const r0 = await fetch(BASE_URL + "/lmsa-web/index.jsp", { redirect: "manual" });
-    updateCookies(r0.headers);
-  } catch (err) {
-    console.warn("[!] Warning: Initial cookie handshake failed:", err.message);
-  }
-
-  await fetchRsaKey();
-
-  const rawLoginUrl = await getLoginUrl();
-  const loginUrl = new URL(rawLoginUrl);
-  session.oauthState = loginUrl.searchParams.get("state") || "";
-  loginUrl.searchParams.set("redirect_uri", "https://lsa.lenovo.com/Tips/lenovoIdSuccess.html");
-
-  console.log("=======================================================");
-  console.log("AUTHENTICATION");
-  console.log("=======================================================");
-  console.log("1. Open this URL in your web browser:\n");
-  console.log(loginUrl.toString());
-  console.log("\n2. Sign in with your Motorola / Lenovo account.");
-  console.log("3. Once logged in, your browser will redirect to a success page or prompt");
-  console.log("   to open 'softwarefix://callback?...'");
-  console.log("\n   * If your browser shows an 'Open with / Application' dialog, copy that URI.");
-  console.log("   * In Firefox / Linux: Press F12 -> Console. You will see a line like:");
-  console.log('     Prevented navigation to "softwarefix://callback?...Authorization=<token>"');
-  console.log("     Copy the entire URI or the token value and paste it below.");
-  console.log("=======================================================\n");
-
-  openBrowser(loginUrl.toString());
 
   const rl = createInterface({ input: process.stdin, output: process.stdout });
   const ac = new AbortController();
@@ -675,25 +650,96 @@ async function login() {
   process.once("SIGINT", handleSigint);
 
   try {
-    const input = await rl.question("Paste softwarefix:// URI, redirect URL, or session token: ", { signal: ac.signal });
-    const token = await resolveTokenInput(input);
+    let freshLoginRequired = true;
+    let currentLoginUrl = "";
 
-    if (!token) {
-      console.error("\nError: Could not extract a valid Authorization token from the input.");
-      console.error("Make sure to copy the entire 'softwarefix://callback?...' URI or the token value from the console.\n");
-      process.exit(1);
+    while (true) {
+      if (freshLoginRequired) {
+        try {
+          const r0 = await fetch(BASE_URL + "/lmsa-web/index.jsp", { redirect: "manual" });
+          updateCookies(r0.headers);
+        } catch (err) {
+          console.warn("[!] Warning: Initial cookie handshake failed:", err.message);
+        }
+
+        await fetchRsaKey();
+
+        const rawLoginUrl = await getLoginUrl();
+        const loginUrl = new URL(rawLoginUrl);
+        session.oauthState = loginUrl.searchParams.get("state") || "";
+        loginUrl.searchParams.set("redirect_uri", "https://lsa.lenovo.com/Tips/lenovoIdSuccess.html");
+        currentLoginUrl = loginUrl.toString();
+
+        console.log("=======================================================");
+        console.log("AUTHENTICATION");
+        console.log("=======================================================");
+        console.log("1. Open this FRESH URL in your web browser:\n");
+        console.log(currentLoginUrl);
+        console.log("\n2. Sign in with your Motorola / Lenovo account.");
+        console.log("3. Once logged in, your browser will redirect to a success page or prompt");
+        console.log("   to open 'softwarefix://callback?...'");
+        console.log("\n   * In Firefox / Linux: Press F12 -> Console tab. Look for:");
+        console.log('     Prevented navigation to "softwarefix://callback?...Authorization=<token>"');
+        console.log("     Copy the entire URI or the token value and paste it below.");
+        console.log("   * Important: Tokens expire in a few minutes. Please paste immediately.");
+        console.log("=======================================================\n");
+
+        openBrowser(currentLoginUrl);
+        freshLoginRequired = false;
+      }
+
+      const input = await rl.question("Paste softwarefix:// URI, redirect URL, or session token (or 'new' for new link): ", { signal: ac.signal });
+      const cleanInput = (input || "").trim();
+
+      if (cleanInput.toLowerCase() === "new") {
+        console.log("\n[i] Generating new fresh login session...\n");
+        freshLoginRequired = true;
+        continue;
+      }
+
+      const token = await resolveTokenInput(cleanInput);
+
+      if (!token) {
+        console.error("\n[!] Error: Could not extract a valid Authorization token from the input.");
+        console.error("    Ensure you copy the entire 'softwarefix://callback?...' URI or the token value.");
+        console.log("    Type 'new' to generate a fresh login URL, or paste again.\n");
+        continue;
+      }
+
+      console.log("[i] Validating session token with Motorola backend...");
+      const probe = await validateTokenWithBackend(token);
+
+      if (!probe.valid) {
+        console.warn("\n[!] Backend Validation Failed:");
+        console.warn(`    Server response: ${probe.reason || "Invalid token or expired session"} (Code: ${probe.code || probe.status || "Unknown"})`);
+        console.warn("    This usually happens if the link is old or the session timed out.");
+
+        const action = await rl.question("\nOptions: [R]e-paste, [N]ew fresh login URL, [F]orce save anyway, [Q]uit: ", { signal: ac.signal });
+        const act = (action || "").trim().toLowerCase();
+
+        if (act === "n") {
+          freshLoginRequired = true;
+          console.log("");
+          continue;
+        } else if (act === "f") {
+          console.log("\n[!] Force saving session token per user request...");
+          session.jwt = token;
+          saveState();
+          console.log("Session saved to", STATE_FILE);
+          break;
+        } else if (act === "q") {
+          process.exit(1);
+        } else {
+          console.log("");
+          continue;
+        }
+      }
+
+      session.jwt = token;
+      saveState();
+      console.log("\nLogin successful! Active session verified and saved to", STATE_FILE);
+      break;
     }
-
-    console.log("[i] Validating session with Motorola backend...");
-    const isValid = await validateTokenWithBackend(token);
-    if (!isValid) {
-      console.error("\nError: Token validation failed against Motorola server (token is invalid or expired).");
-      process.exit(1);
-    }
-
-    session.jwt = token;
-    saveState();
-    console.log("\nLogin successful! Active session saved to", STATE_FILE);
   } finally {
     process.removeListener("SIGINT", handleSigint);
     rl.close();
