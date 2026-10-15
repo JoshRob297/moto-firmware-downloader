@@ -17,7 +17,11 @@ Thank you for your interest in contributing!
    - Ensure the project maintains **zero third-party runtime dependencies** (use native Node.js built-ins).
    - Verify code passes syntax and tests:
      ```bash
-     npm test
+     npm test          # runs: node --check, node --test and a CLI smoke check
+     ```
+     Equivalent without npm:
+     ```bash
+     node --check mfd-cli.mjs && node --test && node mfd-cli.mjs --help
      ```
    - Submit PR targeting `main`.
 

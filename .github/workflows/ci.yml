@@ -23,5 +23,21 @@ jobs:
       with:
         node-version: ${{ matrix.node-version }}
 
-    - name: Syntax verification & CLI check
-      run: npm test
+    - name: Syntax verification and CLI check
+      run: |
+        node --check mfd-cli.mjs
+        node --test
+        node mfd-cli.mjs --help
+
+    - name: Version consistency
+      shell: bash
+      run: |
+        PKG_VERSION=$(node -e "import fs from 'node:fs'; console.log(JSON.parse(fs.readFileSync('./package.json','utf8')).version);")
+        CLI_VERSION=$(node -e "import fs from 'node:fs'; const m=fs.readFileSync('./mfd-cli.mjs','utf8').match(/const VERSION = \"([^\"]+)\"/); console.log(m[1]);")
+        echo "package.json: $PKG_VERSION | mfd-cli.mjs: $CLI_VERSION"
+        test "$PKG_VERSION" = "$CLI_VERSION"
+
+    - name: Installer syntax check
+      if: runner.os != 'Windows'
+      shell: bash
+      run: bash -n install.sh

@@ -1,6 +1,6 @@
 # Moto Firmware Downloader (MFD)
 
-[![NPM Version](https://img.shields.io/npm/v/moto-firmware-downloader.svg)](https://www.npmjs.com/package/moto-firmware-downloader)
+[![Latest Release](https://img.shields.io/github/v/release/JoshRob297/moto-firmware-downloader.svg)](https://github.com/JoshRob297/moto-firmware-downloader/releases/latest)
 [![CI](https://github.com/JoshRob297/moto-firmware-downloader/actions/workflows/ci.yml/badge.svg)](https://github.com/JoshRob297/moto-firmware-downloader/actions/workflows/ci.yml)
 [![Node Version](https://img.shields.io/badge/node-%3E%3D18.0.0-brightgreen.svg)](https://nodejs.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
@@ -12,14 +12,22 @@ This tool bypasses the `410 Missing device fingerprint` and `411 Invalid device 
 
 ---
 
+## Distribution Policy
+
+**MFD is distributed exclusively through GitHub since v1.3.0.** There is no npm registry publication: no account, no tokens, no renewal, and no third-party registry in the supply chain. Every release ships the exact `mfd-cli.mjs` artifact as a GitHub Release asset together with the installers, so what you run is what the repository contains.
+
+Older versions (`<= 1.2.4`) remain on the npm registry as frozen artifacts. They are not maintained and no longer match the current codebase.
+
+---
+
 ## Key Features
 
-* **Interactive Guided Wizard:** Run `npx moto-firmware-downloader` without arguments to launch a step-by-step assistant that searches, lists available regional builds, and downloads with one click.
+* **Interactive Guided Wizard:** Run `mfd` without arguments to launch a step-by-step assistant that searches, lists available regional builds, and downloads with one click.
 * **Auto OAuth Code Resolution:** Paste the redirect URL or raw authorization code directly; the CLI automatically resolves the final session token.
 * **Accelerated Multi-Threaded Downloads:** Uses parallel HTTP `Range: bytes` chunks to maximize bandwidth on high-speed connections.
 * **Automated Integrity Verification:** Validates ZIP structural integrity (EOCD/Central Directory) and AWS S3 ETag/MD5 checksums after download.
-* **Zero External Dependencies:** Built exclusively with native Node.js standard modules (`crypto`, `readline`, `child_process`, `stream`, `fs`).
 * **Built-in Network Doctor:** `mfd doctor` isolates DNS, TCP/TLS, proxy and HTTP layers and surfaces the real transport error code behind Node's generic `fetch failed`.
+* **Zero External Dependencies:** Built exclusively with native Node.js standard modules (`crypto`, `readline`, `child_process`, `stream`, `fs`).
 
 ---
 
@@ -29,30 +37,45 @@ This tool bypasses the `410 Missing device fingerprint` and `411 Invalid device 
 
 ---
 
-## Quick Start & Installation
+## Installation
 
-### Option A: Run directly with npx (Recommended - No install required)
+### Option A: One-line installer (Recommended)
+
+Linux and macOS:
+
 ```bash
-# Launch interactive wizard
-npx moto-firmware-downloader
-
-# Or run specific commands directly
-npx moto-firmware-downloader login
-npx moto-firmware-downloader imei XT2415-1 35xxxxxxxxxxxxx --download
+curl -fsSL https://raw.githubusercontent.com/JoshRob297/moto-firmware-downloader/main/install.sh | bash
 ```
 
-### Option B: Install globally via npm
-```bash
-npm install -g moto-firmware-downloader
-mfd
+Windows (PowerShell):
+
+```powershell
+irm https://raw.githubusercontent.com/JoshRob297/moto-firmware-downloader/main/install.ps1 | iex
 ```
 
-### Option C: Clone from GitHub
+The installer validates the Node version, checks the script syntax, places `mfd` in `~/.local/bin` (or `%LOCALAPPDATA%\mfd` on Windows) and reports the PATH entry when one is needed. Override the target with `MFD_DEST=/usr/local/bin`, or install a specific revision with `MFD_REF=v1.3.0`.
+
+### Option B: Manual download from the latest release
+
+```bash
+curl -fsSL -O https://github.com/JoshRob297/moto-firmware-downloader/releases/latest/download/mfd-cli.mjs
+chmod +x mfd-cli.mjs
+./mfd-cli.mjs --version
+```
+
+### Option C: Clone the repository
+
 ```bash
 git clone https://github.com/JoshRob297/moto-firmware-downloader.git
 cd moto-firmware-downloader
 chmod +x mfd-cli.mjs
-npm link
+./mfd-cli.mjs --help
+```
+
+Optional, to expose the `mfd` command locally without any registry involved:
+
+```bash
+npm link        # local symlink only, never touches a registry
 ```
 
 ---
@@ -60,7 +83,7 @@ npm link
 ## Usage
 
 ### 1. Interactive Wizard (Recommended)
-Simply run `mfd` or `npx moto-firmware-downloader` without parameters:
+Simply run `mfd` without parameters:
 ```bash
 mfd
 ```
@@ -116,6 +139,12 @@ mfd imei XT2435-1 351234567890123 --urls-only | xargs -n 1 aria2c -x 16
 mfd search <Model> [--json]
 ```
 
+#### Diagnose Connectivity
+```bash
+mfd doctor [--json]
+```
+Reports DNS resolution, TCP/TLS handshake and certificate issuer, proxy state and per-endpoint HTTP status, then states whether the Lenovo backend is reachable from your machine.
+
 ---
 
 ## Technical Details: The Fingerprint Bypass
@@ -147,8 +176,10 @@ The Lenovo backend answers normally when reached over a clean route. A blanket f
 
 ### Other issues
 
+* **Command not found after installing:** the installer prints the PATH entry to add; restart the terminal afterwards on Windows.
 * **Authentication Error:** Re-run `mfd login` (or set `export MFD_JWT="..."`).
 * **Empty results / ROM not found:** Verify the exact model code (e.g. `XT2415-1` vs `XT2435-1`) and check different carrier channels (`retla`, `reteu`, `retus`, `retbr`).
+* **Running an old copy:** verify with `mfd --version` and re-run the installer to move to the latest release.
 
 ---
 

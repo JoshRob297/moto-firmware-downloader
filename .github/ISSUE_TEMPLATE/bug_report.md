@@ -15,6 +15,8 @@ A clear and concise description of what the bug is.
 - Carrier / Region:
 - OS & Version (e.g. Ubuntu 24.04, Windows 11, macOS 14):
 - Node.js Version (`node -v`):
+- MFD Version (`mfd --version`) and install method (installer script / manual release download / git clone):
+- Output of `mfd doctor` (required for any network or authentication failure):
 
 **Steps To Reproduce:**
 1. Run command: `...`

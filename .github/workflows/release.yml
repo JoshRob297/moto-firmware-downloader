@@ -1,0 +1,59 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.x
+
+      - name: Verify version consistency
+        run: |
+          PKG_VERSION=$(node -e "import fs from 'node:fs'; console.log(JSON.parse(fs.readFileSync('./package.json','utf8')).version);")
+          CLI_VERSION=$(node -e "import fs from 'node:fs'; const m=fs.readFileSync('./mfd-cli.mjs','utf8').match(/const VERSION = \"([^\"]+)\"/); console.log(m[1]);")
+          echo "package.json: $PKG_VERSION | mfd-cli.mjs: $CLI_VERSION"
+          if [ "$PKG_VERSION" != "$CLI_VERSION" ]; then
+            echo "Version mismatch between package.json and mfd-cli.mjs"
+            exit 1
+          fi
+
+      - name: Run verification and tests
+        run: |
+          node --check mfd-cli.mjs
+          node --test
+          node mfd-cli.mjs --help
+
+      - name: Shellcheck installer
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq shellcheck
+          shellcheck install.sh
+
+      - name: Publish GitHub Release with distribution assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists, uploading assets."
+            gh release upload "$TAG" mfd-cli.mjs install.sh install.ps1 --clobber
+          else
+            gh release create "$TAG" \
+              --title "$TAG" \
+              --generate-notes \
+              mfd-cli.mjs install.sh install.ps1
+          fi
