@@ -22,13 +22,7 @@ command -v node >/dev/null 2>&1 || {
   exit 1
 }
 
-node -e '
-const major = Number(process.versions.node.split(".")[0]);
-if (major < 18) {
-  console.error(`[!] Node.js 18 or newer is required, found ${process.version}`);
-  process.exit(1);
-}
-'
+node -e 'const major = Number(process.versions.node.split(".")[0]); if (major < 18) { console.error("[!] Node.js 18 or newer is required, found " + process.version); process.exit(1); }'
 
 if [ -n "${MFD_SOURCE:-}" ]; then
   SOURCE_DESC="local file $MFD_SOURCE"
