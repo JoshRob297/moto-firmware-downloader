@@ -23,7 +23,7 @@ Older versions (`<= 1.2.4`) remain on the npm registry as frozen artifacts. They
 ## Key Features
 
 * **Interactive Guided Wizard:** Run `mfd` without arguments to launch a step-by-step assistant that searches, lists available regional builds, and downloads with one click.
-* **Auto OAuth Code Resolution:** Paste the redirect URL or raw authorization code directly; the CLI automatically resolves the final session token.
+* **Guided Token Capture:** The login prompt prints the exact steps to grab the session token from the browser (console or Network tab). Both the JWT and the 32-character token formats are accepted. See [`docs/AUTHENTICATION.md`](docs/AUTHENTICATION.md).
 * **Accelerated Multi-Threaded Downloads:** Uses parallel HTTP `Range: bytes` chunks to maximize bandwidth on high-speed connections.
 * **Automated Integrity Verification:** Validates ZIP structural integrity (EOCD/Central Directory) and AWS S3 ETag/MD5 checksums after download.
 * **Built-in Network Doctor:** `mfd doctor` isolates DNS, TCP/TLS, proxy and HTTP layers and surfaces the real transport error code behind Node's generic `fetch failed`.
@@ -102,7 +102,16 @@ The wizard will:
 ```bash
 mfd login
 ```
-Open the generated link, sign in with your Motorola account, and paste the redirect URL or authorization code into the prompt.
+
+1. Open the fresh URL the CLI prints and sign in with your Motorola / Lenovo account.
+2. Capture the session token the browser hands to the desktop client:
+   * **Console:** `F12` → Console → look for `Prevented navigation to "softwareFix://authcallback?...Authorization=eyJ..."`.
+   * **Network (most reliable):** `F12` → Network → filter `callback.jhtml` → Response → copy the `Authorization` value.
+3. Paste the whole URI or just the token into the prompt.
+
+Both token formats work: the JWT (`eyJ...`) from `softwareFix://authcallback` and the 32-character value from `softwarefix://callback`. Tokens are short-lived, so paste immediately. Do **not** paste the `code=` from the `lenovoIdSuccess.html` redirect URL - the browser consumes that one-time code before you can reuse it.
+
+Full procedure, response-code table and troubleshooting: [`docs/AUTHENTICATION.md`](docs/AUTHENTICATION.md).
 
 *Tip for headless servers:* Export the token directly via environment variable:
 ```bash

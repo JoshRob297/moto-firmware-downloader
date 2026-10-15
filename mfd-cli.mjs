@@ -27,7 +27,7 @@ import {
   createHash
 } from "node:crypto";
 
-const VERSION = "1.3.2";
+const VERSION = "1.3.3";
 const BASE_URL = "https://lsa.lenovo.com";
 const API_URL = BASE_URL + "/Interface";
 const USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
@@ -579,8 +579,9 @@ async function resolveTokenInput(rawInput) {
         if (exchanged) return exchanged;
         console.warn("\n[!] The authorization code could not be exchanged with the backend.");
         console.warn("    (The browser automatically consumed the single-use code when loading lenovoIdSuccess.html).");
-        console.warn("    Tip: Check your browser's Developer Tools (F12) -> Console.");
-        console.warn("    Copy the full 'softwarefix://callback?...' URI printed there and paste it here.\n");
+        console.warn("    Tip: F12 -> Console for 'Prevented navigation to softwareFix://authcallback?...' or");
+        console.warn("    F12 -> Network -> filter 'callback.jhtml' -> Response -> copy the Authorization value.");
+        console.warn("    Details: docs/AUTHENTICATION.md\n");
         return null;
       }
     } catch {}
@@ -593,8 +594,9 @@ async function resolveTokenInput(rawInput) {
     if (exchanged) return exchanged;
     console.warn("\n[!] The authorization code could not be exchanged with the backend.");
     console.warn("    (The browser automatically consumed the single-use code when loading lenovoIdSuccess.html).");
-    console.warn("    Tip: Check your browser's Developer Tools (F12) -> Console.");
-    console.warn("    Copy the full 'softwarefix://callback?...' URI printed there and paste it here.\n");
+    console.warn("    Tip: F12 -> Console for 'Prevented navigation to softwareFix://authcallback?...' or");
+    console.warn("    F12 -> Network -> filter 'callback.jhtml' -> Response -> copy the Authorization value.");
+    console.warn("    Details: docs/AUTHENTICATION.md\n");
     return null;
   }
 
@@ -949,8 +951,12 @@ async function login() {
         console.log("\n   * In Firefox / Linux: Press F12 -> Console tab. Look for:");
         console.log('     Prevented navigation to "softwareFix://authcallback?...Authorization=eyJ..."');
         console.log("     Copy that whole URI or just the token ('eyJ...') and paste it below.");
+        console.log("   * Reliable fallback (works even if the browser blocks the custom scheme):");
+        console.log("     F12 -> Network tab -> filter 'callback.jhtml' -> Response -> copy the Authorization value.");
         console.log("   * The 'softwarefix://callback?...Authorization=<32 hex chars>' value also works:");
         console.log("     paste the whole URI or just the 32-character value.");
+        console.log("   * Do NOT paste the 'code=' from the lenovoIdSuccess.html redirect: the browser already");
+        console.log("     consumed it and a second exchange answers 'oauth2 state not found'.");
         console.log("   * Important: Tokens are short-lived. Paste immediately after logging in.");
         console.log("=======================================================\n");
 
