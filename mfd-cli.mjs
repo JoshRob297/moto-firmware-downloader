@@ -122,8 +122,28 @@ async function fetchRsaKey() {
   }
 }
 
+async function getLoginUrl() {
+  await fetchRsaKey();
+  try {
+    const data = await apiRequest(\"/dictionary/getApiInfo.jhtml\");
+    if (data && data.data && data.data.loginUrl) {
+      return data.data.loginUrl;
+    }
+  } catch (err) {
+    console.warn(\"[!] Warning: Could not fetch login URL from API info:\", err.message);
+  }
+  return BASE_URL + \"/lmsa-web/index.jsp\";
+}
+
+async function login() {
+  console.log(\"[!] Initiating authentication...\");
+  const loginUrl = await getLoginUrl();
+  console.log(`[!] Please authenticate via: ${loginUrl}`);
+}
+
 async function main() {
-  console.log(`Moto Firmware Downloader (MFD) v${VERSION} - CLI Tool`);
+  console.log(`Moto Firmware Downloader (MFD) v${VERSION} - Interactive Wizard`);
+  await login();
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {
