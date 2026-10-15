@@ -27,7 +27,7 @@ import {
   createHash
 } from "node:crypto";
 
-const VERSION = "1.3.0";
+const VERSION = "1.3.1";
 const BASE_URL = "https://lsa.lenovo.com";
 const API_URL = BASE_URL + "/Interface";
 const USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
@@ -436,26 +436,51 @@ async function getLoginUrl() {
   throw new Error("Could not retrieve login URL: " + JSON.stringify(data));
 }
 
+/**
+ * Builds the platform command used to open a URL in the default browser.
+ *
+ * Windows note: `cmd.exe /c start` re-parses its own command line and treats `&`
+ * as a command separator, so OAuth URLs are truncated at the first query
+ * parameter (`...?state=X&client_id=Y` opens as `...?state=X`). explorer.exe
+ * receives the URL as a plain argv entry and hands it to the shell untouched.
+ * Kept pure so the argument construction is unit-testable on any platform.
+ */
+function buildBrowserOpenCommand(platform, href) {
+  if (platform === "win32") {
+    return { command: "explorer.exe", args: [href], fallback: { command: "rundll32.exe", args: ["url.dll,FileProtocolHandler", href] } };
+  }
+  if (platform === "darwin") {
+    return { command: "open", args: [href] };
+  }
+  return { command: "xdg-open", args: [href], fallback: { command: "sensible-browser", args: [href] } };
+}
+
 function openBrowser(targetUrl) {
   try {
     const parsed = new URL(targetUrl);
     if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return;
 
-    if (process.platform === "win32") {
-      spawn("cmd.exe", ["/c", "start", '""', parsed.href], { stdio: "ignore", detached: true }).unref();
-    } else if (process.platform === "darwin") {
-      spawn("open", [parsed.href], { stdio: "ignore", detached: true }).unref();
-    } else {
-      spawn("xdg-open", [parsed.href], { stdio: "ignore", detached: true }).unref();
-    }
+    const plan = buildBrowserOpenCommand(process.platform, parsed.href);
+    const child = spawn(plan.command, plan.args, { stdio: "ignore", detached: true });
+    child.on("error", () => {
+      if (!plan.fallback) return;
+      try {
+        spawn(plan.fallback.command, plan.fallback.args, { stdio: "ignore", detached: true }).unref();
+      } catch {}
+    });
+    child.unref();
   } catch {}
 }
 
 /**
  * Checks if a string matches an authorized session token format.
  * Accepts:
- * 1. Standard JWTs (starting with eyJ... with 3 segments)
- * 2. Native Lenovo LMSA session tokens (32-character hexadecimal MD5 hash)
+ * 1. Standard JWTs (starting with eyJ... with 3 segments): the value the LMSA
+ *    backend actually accepts as a session token.
+ * 2. 32-character hexadecimal values, kept for compatibility with older
+ *    'softwarefix://callback' URIs. Verified against the live backend: any
+ *    32-hex value is answered with an identical 'Invalid token.' response, so
+ *    this format is accepted for input parsing but cannot authenticate.
  */
 function isValidSessionToken(str) {
   if (typeof str !== "string") return false;
@@ -773,22 +798,94 @@ async function verifyFileIntegrity(filePath, s3Etag = "", calculatedMd5 = "") {
  * Live validation of session token against Motorola/Lenovo backend.
  * Returns { valid: boolean, reason?: string, status?: number, code?: string }
  */
+/**
+ * Endpoint the tool actually consumes for catalog queries. Used as the live
+ * validation probe so a successful probe guarantees a working session for the
+ * commands that follow.
+ */
+const VALIDATION_PATH = "/rescueDevice/getRomMatchParams.jhtml";
+const VALIDATION_MODEL = "XT2435-1";
+
+function isHex32Token(str) {
+  return typeof str === "string" && /^[a-fA-F0-9]{32}$/.test(str.trim());
+}
+
+function isJwtToken(str) {
+  if (typeof str !== "string") return false;
+  const parts = str.trim().split(".");
+  return parts.length === 3 && parts[0].startsWith("eyJ");
+}
+
+/**
+ * True when the response body looks like a genuine Lenovo LMSA payload.
+ * A middlebox (proxy, VPN, AV TLS inspection or captive portal) answers with
+ * its own JSON/HTML that carries none of these fields.
+ */
+function isLmsaPayload(data) {
+  if (!data || typeof data !== "object" || Array.isArray(data)) return false;
+  return "desc" in data || "code" in data || "msg" in data || "content" in data;
+}
+
+function probeFailureDetail(response, raw) {
+  return raw.replace(/\s+/g, " ").trim().slice(0, 200) || "(empty body)";
+}
+
 async function validateTokenWithBackend(token) {
   const originalJwt = session.jwt;
   session.jwt = token;
-  try {
-    const r = await apiRequest("/query/matchParams.jhtml", { modelName: "XT2435-1" });
-    const data = await parseJsonResponse(r);
-    const isFailure = checkAuthFailure(r.status, data);
+  const url = API_URL + VALIDATION_PATH;
 
-    if (isFailure) {
-      const reason = data?.desc || data?.msg || `HTTP ${r.status}`;
-      return { valid: false, reason, status: r.status, code: data?.code };
+  try {
+    const r = await apiRequest(VALIDATION_PATH, { modelName: VALIDATION_MODEL });
+    const raw = await r.text();
+
+    let data = null;
+    try {
+      data = JSON.parse(raw);
+    } catch {}
+
+    if (!isLmsaPayload(data)) {
+      return {
+        valid: false,
+        intercepted: true,
+        url,
+        status: r.status,
+        reason: `unexpected non-LMSA response (HTTP ${r.status}${r.statusText ? " " + r.statusText : ""})`,
+        detail: probeFailureDetail(r, raw)
+      };
     }
 
-    return { valid: r.ok, status: r.status, code: data?.code };
+    if (checkAuthFailure(r.status, data)) {
+      return {
+        valid: false,
+        url,
+        status: r.status,
+        code: data.code,
+        reason: data.desc || data.msg || `HTTP ${r.status}`,
+        detail: probeFailureDetail(r, raw)
+      };
+    }
+
+    if (!r.ok) {
+      return {
+        valid: false,
+        url,
+        status: r.status,
+        code: data.code,
+        reason: data.desc || data.msg || `HTTP ${r.status}`,
+        detail: probeFailureDetail(r, raw)
+      };
+    }
+
+    return { valid: true, url, status: r.status, code: data.code };
   } catch (err) {
-    return { valid: false, reason: err.message };
+    const detail = err.networkDetail || unwrapNetworkError(err);
+    return {
+      valid: false,
+      url,
+      transport: detail.code || null,
+      reason: `transport error: ${detail.code || err.message}`
+    };
   } finally {
     session.jwt = originalJwt;
   }
@@ -844,10 +941,12 @@ async function login() {
         console.log(currentLoginUrl);
         console.log("\n2. Sign in with your Motorola / Lenovo account.");
         console.log("3. Once logged in, your browser will redirect to a success page or prompt");
-        console.log("   to open 'softwarefix://callback?...'");
+        console.log("   to open 'softwareFix://authcallback?Authorization=eyJ...'");
         console.log("\n   * In Firefox / Linux: Press F12 -> Console tab. Look for:");
-        console.log('     Prevented navigation to "softwarefix://callback?...Authorization=<token>"');
-        console.log("     Copy the entire URI or the token value and paste it below.");
+        console.log('     Prevented navigation to "softwareFix://authcallback?...Authorization=eyJ..."');
+        console.log("     Copy that whole URI or just the JWT (starts with 'eyJ') and paste it below.");
+        console.log("   * Do NOT paste the 'softwarefix://callback?...Authorization=<32 hex chars>' value: it is");
+        console.log("     a one-time code consumed by the browser, and the backend rejects it as a session token.");
         console.log("   * Important: Tokens expire in a few minutes. Please paste immediately.");
         console.log("=======================================================\n");
 
@@ -877,9 +976,31 @@ async function login() {
       const probe = await validateTokenWithBackend(token);
 
       if (!probe.valid) {
-        console.warn("\n[!] Backend Validation Failed:");
-        console.warn(`    Server response: ${probe.reason || "Invalid token or expired session"} (Code: ${probe.code || probe.status || "Unknown"})`);
-        console.warn("    This usually happens if the link is old or the session timed out.");
+        console.warn("\n[!] Backend Validation Failed");
+        console.warn(`    Endpoint: ${probe.url}`);
+        console.warn(`    Server response: ${probe.reason}${probe.code ? ` (code ${probe.code})` : ""}${probe.status ? ` [HTTP ${probe.status}]` : ""}`);
+        if (probe.detail) {
+          console.warn(`    Raw body: ${probe.detail}`);
+        }
+
+        if (probe.intercepted) {
+          console.warn("    The response did not come from the Lenovo API: it carries none of the LMSA");
+          console.warn("    fields (code/desc/msg). A proxy, VPN, captive portal or antivirus HTTPS");
+          console.warn("    inspection layer answered instead. Run 'mfd doctor' to identify the layer.");
+        } else if (isHex32Token(token)) {
+          console.warn("    The value you pasted is a 32-character hexadecimal code, which the Lenovo backend");
+          console.warn("    rejects whenever it is used as a session token (the same response is returned for");
+          console.warn("    a random control value). That URI is a one-time code already consumed by the");
+          console.warn("    browser, not a reusable credential.");
+          console.warn("    Use the JWT instead: copy the value from the 'softwareFix://authcallback?Authorization=eyJ...'");
+          console.warn("    prompt (Firefox console or success page after signing in) and paste it here.");
+        } else if (probe.transport) {
+          console.warn("    The request never completed. Check the transport layer with 'mfd doctor'.");
+        } else {
+          console.warn("    This usually happens if the link is old or the session timed out.");
+        }
+
+        console.warn(`    Proxy: ${proxyStatus.configured ? `requests routed via ${proxyStatus.proxy}` : "direct connection"}`);
 
         const action = await rl.question("\nOptions: [R]e-paste, [N]ew fresh login URL, [F]orce save anyway, [Q]uit: ", { signal: ac.signal });
         const act = (action || "").trim().toLowerCase();
@@ -1372,9 +1493,10 @@ async function runDoctor(jsonOutput = false) {
     : await tlsProbe(host);
 
   const httpTargets = [
-    { label: "cookie handshake (GET)", path: "/lmsa-web/index.jsp", method: "GET" },
-    { label: "RSA public key (POST)", path: "/Interface/common/rsa.jhtml", method: "POST" },
-    { label: "login URL dictionary (POST)", path: "/Interface/dictionary/getApiInfo.jhtml", method: "POST" }
+    { label: "cookie handshake (GET)", path: "/lmsa-web/index.jsp", method: "GET", expectLmsa: false, dparams: {} },
+    { label: "RSA public key (POST)", path: "/Interface/common/rsa.jhtml", method: "POST", expectLmsa: true, dparams: {} },
+    { label: "login URL dictionary (POST)", path: "/Interface/dictionary/getApiInfo.jhtml", method: "POST", expectLmsa: true, dparams: { key: "TIP_URL" } },
+    { label: "catalog endpoint gated (POST)", path: "/Interface" + VALIDATION_PATH, method: "POST", expectLmsa: true, dparams: { modelName: VALIDATION_MODEL } }
   ];
 
   for (const target of httpTargets) {
@@ -1384,12 +1506,31 @@ async function runDoctor(jsonOutput = false) {
         method: target.method,
         redirect: "manual",
         headers: { "Content-Type": "application/json", "User-Agent": USER_AGENT, "Request-Tag": "lmsa" },
-        body: target.method === "POST" ? JSON.stringify({ client: { version: CLIENT_VERSION }, language: "en-US", dparams: {} }) : undefined
+        body: target.method === "POST" ? JSON.stringify({ client: { version: CLIENT_VERSION }, language: "en-US", dparams: target.dparams }) : undefined
       }, { attempts: 2, quiet: true });
-      report.http.push({ label: target.label, url, status: r.status, ok: true });
+
+      const raw = await r.text();
+      let body = null;
+      try {
+        body = JSON.parse(raw);
+      } catch {}
+
+      const lmsaShape = isLmsaPayload(body);
+      report.http.push({
+        label: target.label,
+        url,
+        status: r.status,
+        ok: true,
+        lmsaShape,
+        lmsaCode: lmsaShape ? body.code || null : null,
+        lmsaDesc: lmsaShape ? body.desc || body.msg || null : null,
+        suspicious: target.expectLmsa && !lmsaShape,
+        bodyHead: lmsaShape ? null : probeFailureDetail(r, raw)
+      });
     } catch (err) {
       const detail = err.networkDetail || unwrapNetworkError(err);
-      report.http.push({ label: target.label, url, ok: false, code: detail.code || null, message: detail.message });    }
+      report.http.push({ label: target.label, url, ok: false, code: detail.code || null, message: detail.message });
+    }
   }
 
   if (jsonOutput) {
@@ -1398,6 +1539,7 @@ async function runDoctor(jsonOutput = false) {
   }
 
   const netOk = report.http.some((e) => e.ok);
+  const intercepted = report.http.some((e) => e.suspicious);
   console.log("========================================================================");
   console.log(` MFD Connectivity Doctor - v${VERSION}`);
   console.log("========================================================================");
@@ -1427,8 +1569,12 @@ async function runDoctor(jsonOutput = false) {
   }
   console.log("\n[5] HTTP probes");
   for (const entry of report.http) {
-    if (entry.ok) {
-      console.log(`    [OK]   HTTP ${String(entry.status).padEnd(3)} ${entry.label}`);
+    if (entry.ok && entry.suspicious) {
+      console.log(`    [WARN] HTTP ${String(entry.status).padEnd(3)} ${entry.label} - body is not an LMSA payload`);
+      console.log(`           Possible interception. Body: ${entry.bodyHead}`);
+    } else if (entry.ok) {
+      const shape = entry.lmsaShape === false ? " (non-LMSA body)" : entry.lmsaCode ? ` (LMSA code ${entry.lmsaCode}${entry.lmsaDesc ? `: ${String(entry.lmsaDesc).slice(0, 60)}` : ""})` : "";
+      console.log(`    [OK]   HTTP ${String(entry.status).padEnd(3)} ${entry.label}${shape}`);
     } else {
       console.log(`    [FAIL] ${entry.code || entry.message || "unknown"} ${entry.label}`);
     }
@@ -1437,9 +1583,15 @@ async function runDoctor(jsonOutput = false) {
   console.log(`    File:    ${report.state.file}`);
   console.log(`    Session: ${report.state.hasSession ? "present" : "missing (run 'mfd login')"}`);
   console.log("\n------------------------------------------------------------------------");
-  if (netOk) {
-    console.log("RESULT: backend reachable. If the wizard still fails, the fault is in");
-    console.log("        this local network path only for specific requests (proxy, MTU).");
+  if (intercepted) {
+    console.log("RESULT: at least one request returned a body that is not an LMSA payload.");
+    console.log("        A middlebox (proxy, VPN, captive portal or antivirus HTTPS inspection)");
+    console.log("        is likely rewriting responses. Check the proxy dispatcher above and");
+    console.log("        exclude Node.js from HTTPS scanning.");
+  } else if (netOk) {
+    console.log("RESULT: backend reachable and answering with Lenovo LMSA payloads. If the");
+    console.log("        wizard still fails, the fault is in this local network path only for");
+    console.log("        specific requests (proxy, MTU).");
   } else {
     console.log("RESULT: no request reached the Lenovo backend. The fault is on the");
     console.log("        local egress path (DNS, firewall, AV/TLS inspection, proxy or");

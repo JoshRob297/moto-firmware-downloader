@@ -157,6 +157,19 @@ Motorola servers enforce the `X-Device-Fingerprint` HTTP header. This tool imple
 
 ## Troubleshooting
 
+### `Backend Validation Failed` during `mfd login`
+
+Since v1.3.1 the login probe reports the endpoint it called, the verbatim server response, the raw body and the proxy state, and it validates against the same catalog endpoint the commands use. Read the response code:
+
+| Observed | Meaning | Action |
+|---|---|---|
+| `403 Invalid token.` | The value is not a session token (see below). | Use the JWT from `softwareFix://authcallback` |
+| `410 Missing device fingerprint.` | The RSA key was not fetched before the call. | Check that `mfd doctor` shows the RSA probe as LMSA `0000` |
+| `412 Fingerprint expired.` | Clock skew on the machine. | Sync the system clock and retry |
+| `unexpected non-LMSA response (HTTP 404 ...)` | Something other than the Lenovo API answered. | A proxy, VPN, captive portal or antivirus HTTPS inspection is rewriting responses; run `mfd doctor` |
+
+**Which value to paste.** The working credential is the JWT from the `softwareFix://authcallback?Authorization=eyJ...` prompt (Firefox console or the success page, value starts with `eyJ`). The lowercase `softwarefix://callback?fullName=...&Authorization=<32 hex characters>` value is a one-time code that the browser has already consumed: the backend answers an identical `403 Invalid token.` for it and for a random control value, so it cannot be used as a session token. Paste it and the CLI will tell you exactly that.
+
 ### `Network failure connecting to https://lsa.lenovo.com/...: fetch failed`
 
 Since v1.2.5 the CLI prints the real transport error code (`ENOTFOUND`, `ECONNRESET`, `ETIMEDOUT`, TLS errors) instead of the opaque `fetch failed`, and retries transient faults automatically. Run the built-in connectivity doctor first:
@@ -165,7 +178,16 @@ Since v1.2.5 the CLI prints the real transport error code (`ENOTFOUND`, `ECONNRE
 mfd doctor
 ```
 
-It isolates each layer and reports DNS resolution, TCP/TLS handshake (including the certificate issuer, which exposes TLS interception), proxy state and per-endpoint HTTP status, then states whether the backend is reachable from your machine.
+It isolates each layer and reports DNS resolution, TCP/TLS handshake (including the certificate issuer, which exposes TLS interception), proxy state and per-endpoint HTTP status, then states whether the backend is reachable from your machine. A healthy run looks like this:
+
+```text
+[OK]   HTTP 302 cookie handshake (GET)
+[OK]   HTTP 200 RSA public key (POST) (LMSA code 0000: ...)
+[OK]   HTTP 200 login URL dictionary (POST) (LMSA code 0000: success)
+[OK]   HTTP 200 catalog endpoint gated (POST) (LMSA code 410: Missing device fingerprint.)
+```
+
+The catalog probe is expected to answer `410 Missing device fingerprint.` before you log in: that proves the API edge is serving the tool and not a middlebox. An HTML `404` or any body without LMSA fields means something in your network is answering on behalf of Lenovo. An unexpected certificate issuer means TLS interception.
 
 The Lenovo backend answers normally when reached over a clean route. A blanket failure of every request (cookie handshake, RSA key and login dictionary all failing at once) points to the local egress path, not to a service outage:
 
@@ -176,6 +198,7 @@ The Lenovo backend answers normally when reached over a clean route. A blanket f
 
 ### Other issues
 
+* **Browser opens a login page that errors out (Windows):** fixed in v1.3.1. Older builds launched the browser through `cmd.exe /c start`, which truncates OAuth URLs at the first `&`, so the page opened with only `?state=...`. The CLI now hands the full URL to `explorer.exe`. The console always printed the correct URL, so pasting it manually was the workaround.
 * **Command not found after installing:** the installer prints the PATH entry to add; restart the terminal afterwards on Windows.
 * **Authentication Error:** Re-run `mfd login` (or set `export MFD_JWT="..."`).
 * **Empty results / ROM not found:** Verify the exact model code (e.g. `XT2415-1` vs `XT2435-1`) and check different carrier channels (`retla`, `reteu`, `retus`, `retbr`).
