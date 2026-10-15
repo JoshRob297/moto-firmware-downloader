@@ -19,6 +19,7 @@ This tool bypasses the `410 Missing device fingerprint` and `411 Invalid device 
 * **Accelerated Multi-Threaded Downloads:** Uses parallel HTTP `Range: bytes` chunks to maximize bandwidth on high-speed connections.
 * **Automated Integrity Verification:** Validates ZIP structural integrity (EOCD/Central Directory) and AWS S3 ETag/MD5 checksums after download.
 * **Zero External Dependencies:** Built exclusively with native Node.js standard modules (`crypto`, `readline`, `child_process`, `stream`, `fs`).
+* **Built-in Network Doctor:** `mfd doctor` isolates DNS, TCP/TLS, proxy and HTTP layers and surfaces the real transport error code behind Node's generic `fetch failed`.
 
 ---
 
@@ -126,6 +127,25 @@ Motorola servers enforce the `X-Device-Fingerprint` HTTP header. This tool imple
 ---
 
 ## Troubleshooting
+
+### `Network failure connecting to https://lsa.lenovo.com/...: fetch failed`
+
+Since v1.2.5 the CLI prints the real transport error code (`ENOTFOUND`, `ECONNRESET`, `ETIMEDOUT`, TLS errors) instead of the opaque `fetch failed`, and retries transient faults automatically. Run the built-in connectivity doctor first:
+
+```bash
+mfd doctor
+```
+
+It isolates each layer and reports DNS resolution, TCP/TLS handshake (including the certificate issuer, which exposes TLS interception), proxy state and per-endpoint HTTP status, then states whether the backend is reachable from your machine.
+
+The Lenovo backend answers normally when reached over a clean route. A blanket failure of every request (cookie handshake, RSA key and login dictionary all failing at once) points to the local egress path, not to a service outage:
+
+* **DNS block or filtered resolver:** `nslookup lsa.lenovo.com` returns nothing. Switch DNS resolver, disable VPN split-tunnel or captive portal.
+* **TLS interception:** `mfd doctor` shows an unexpected issuer in the certificate chain. Exclude Node.js from the antivirus/proxy HTTPS scanning.
+* **Corporate proxy:** export `HTTPS_PROXY=http://host:port`. MFD installs a proxy dispatcher automatically; with Node 24+ you can also start it as `NODE_USE_ENV_PROXY=1 node mfd-cli.mjs`.
+* **ISP or regional block:** if the doctor fails at DNS or TCP while the service is confirmed up, retry over a VPN or another network.
+
+### Other issues
 
 * **Authentication Error:** Re-run `mfd login` (or set `export MFD_JWT="..."`).
 * **Empty results / ROM not found:** Verify the exact model code (e.g. `XT2415-1` vs `XT2435-1`) and check different carrier channels (`retla`, `reteu`, `retus`, `retbr`).

@@ -17,6 +17,8 @@ import { pipeline } from "node:stream/promises";
 import { Readable } from "node:stream";
 import { join, basename, resolve } from "node:path";
 import { homedir } from "node:os";
+import { lookup } from "node:dns/promises";
+import { connect as tlsConnect } from "node:tls";
 import {
   publicEncrypt,
   constants,
@@ -25,7 +27,7 @@ import {
   createHash
 } from "node:crypto";
 
-const VERSION = "1.2.4";
+const VERSION = "1.2.5";
 const BASE_URL = "https://lsa.lenovo.com";
 const API_URL = BASE_URL + "/Interface";
 const USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
@@ -41,6 +43,7 @@ const session = {
   oauthState: ""
 };
 const cookieJar = new Map();
+let proxyStatus = { configured: false };
 
 function loadState() {
   if (!existsSync(STATE_FILE)) return;
@@ -133,6 +136,163 @@ function getLastSegmentForLog(url) {
 }
 
 /**
+ * Network resilience layer.
+ *
+ * Node's global fetch (undici) collapses every transport failure into the
+ * opaque string "fetch failed". The real errno (ENOTFOUND, ECONNRESET,
+ * ETIMEDOUT, CERT_HAS_EXPIRED, ...) is buried in err.cause, which is why
+ * users cannot self-diagnose a blocked or proxied network. These helpers
+ * unwrap the cause chain, retry transient faults and emit actionable hints.
+ */
+const TRANSIENT_NET_CODES = new Set([
+  "ECONNRESET",
+  "ECONNREFUSED",
+  "ETIMEDOUT",
+  "EAI_AGAIN",
+  "ENETUNREACH",
+  "EHOSTUNREACH",
+  "EPIPE",
+  "UND_ERR_CONNECT_TIMEOUT",
+  "UND_ERR_SOCKET",
+  "UND_ERR_HEADERS_TIMEOUT",
+  "UND_ERR_BODY_TIMEOUT"
+]);
+
+function unwrapNetworkError(err) {
+  const seen = new Set();
+  let cause = err;
+  let cur = err;
+  while (cur && typeof cur === "object" && !seen.has(cur)) {
+    seen.add(cur);
+    cause = cur;
+    cur = cur.cause;
+  }
+
+  const code = String(cause?.code || err?.code || "").trim();
+  const syscall = String(cause?.syscall || "").trim();
+  const hostname = String(cause?.hostname || "").trim();
+  const message = String(cause?.message || err?.message || "unknown transport error").trim();
+
+  return { code, syscall, hostname, message, transient: TRANSIENT_NET_CODES.has(code) };
+}
+
+function networkHint(detail) {
+  const code = detail.code.toUpperCase();
+  const proxyEnv = process.env.HTTPS_PROXY || process.env.https_proxy ||
+    process.env.HTTP_PROXY || process.env.http_proxy || "";
+
+  if (code === "ENOTFOUND" || code === "EAI_AGAIN") {
+    const target = detail.hostname || "lsa.lenovo.com";
+    return [
+      `DNS could not resolve ${target}.`,
+      "Causes: ISP/regional block, corporate DNS filter, hosts file entry, VPN split-tunnel or stale DNS cache.",
+      `Checks: nslookup ${target} | test with another DNS resolver | disable VPN/AV DNS filtering.`
+    ].join("\n    ");
+  }
+  if (code === "ECONNREFUSED" || code === "ECONNRESET" || code === "EPIPE") {
+    return [
+      "TCP connection was refused or reset before the HTTP exchange completed.",
+      "Causes: local firewall, endpoint security agent (AV/EDR) TLS inspection, or a middlebox dropping the request.",
+      "Checks: allow outbound TCP 443 for node, disable HTTPS scanning temporarily, retry from a different network."
+    ].join("\n    ");
+  }
+  if (code === "ETIMEDOUT" || code.startsWith("UND_ERR") || code === "ENETUNREACH" || code === "EHOSTUNREACH") {
+    return [
+      "Connection attempt timed out or the route is unreachable.",
+      "Causes: silent packet drop (firewall/geo block), broken IPv6 route, or a proxy that is not being used.",
+      "Checks: force IPv4, verify the route with 'mfd doctor', and retry consistently."
+    ].join("\n    ");
+  }
+  if (/CERT|SSL|TLS|UNABLE_TO_VERIFY|SELF_SIGNED|DEPTH_ZERO/.test(code)) {
+    return [
+      "TLS validation failed, so something is intercepting the connection.",
+      "Causes: corporate proxy MITM, expired local root CA, or a captive portal.",
+      "Checks: 'mfd doctor' reports the presented certificate chain owner."
+    ].join("\n    ");
+  }
+  if (detail.message && /proxy/i.test(detail.message)) {
+    return [
+      "The configured proxy rejected the connection.",
+      `Detected proxy env: ${proxyEnv || "none"}`,
+      "Checks: verify credentials/host of HTTPS_PROXY or unset it entirely."
+    ].join("\n    ");
+  }
+  return [
+    "No transport detail beyond the generic fetch failure was reported.",
+    "Run 'mfd doctor' to isolate DNS, TCP/TLS and HTTP layers individually.",
+    proxyEnv ? `Detected proxy env: ${proxyEnv}` : "No proxy environment variable detected."
+  ].join("\n    ");
+}
+
+function formatNetworkFailure(url, err) {
+  const detail = unwrapNetworkError(err);
+  const lines = [
+    "",
+    "[!] NETWORK FAILURE",
+    `    URL:    ${url}`,
+    `    Cause:  ${detail.code || "UNKNOWN"}${detail.syscall ? ` (${detail.syscall})` : ""} - ${detail.message}`,
+    "    Action:",
+    `    ${networkHint(detail)}`,
+    "",
+    "    Run 'mfd doctor' for a full connectivity report."
+  ];
+  return lines.join("\n");
+}
+
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+/**
+ * fetch wrapper with bounded exponential backoff for transient transport faults.
+ * Non-transient failures (DNS, TLS, HTTP-level) fail fast without retrying.
+ */
+async function fetchWithRetry(url, init = {}, options = {}) {
+  const attempts = Math.max(1, Number(options.attempts) || 3);
+  let lastErr;
+
+  for (let i = 1; i <= attempts; i++) {
+    try {
+      return await fetch(url, init);
+    } catch (err) {
+      lastErr = err;
+      const detail = unwrapNetworkError(err);
+      if (!detail.transient || i === attempts) break;
+      const backoff = 500 * 2 ** (i - 1);
+      if (!options.quiet) {
+        console.warn(`[!] Transient network fault (${detail.code || "unknown"}) on attempt ${i}/${attempts}, retrying in ${backoff}ms...`);
+      }
+      await sleep(backoff);
+    }
+  }
+
+  const detail = unwrapNetworkError(lastErr);
+  const wrapped = new Error(`Network failure connecting to ${url}: ${detail.code || detail.message}`);
+  wrapped.cause = lastErr;
+  wrapped.networkDetail = detail;
+  throw wrapped;
+}
+
+/**
+ * Honors standard proxy environment variables by installing an undici
+ * ProxyAgent dispatcher when undici is resolvable (bundled with Node >= 18).
+ * Node 24+ can alternatively be started with NODE_USE_ENV_PROXY=1.
+ */
+async function applyProxyFromEnv() {
+  const proxy = process.env.HTTPS_PROXY || process.env.https_proxy ||
+    process.env.HTTP_PROXY || process.env.http_proxy;
+  if (!proxy) return { configured: false };
+
+  try {
+    const { ProxyAgent, setGlobalDispatcher } = await import("undici");
+    setGlobalDispatcher(new ProxyAgent(proxy));
+    return { configured: true, proxy };
+  } catch (err) {
+    return { configured: false, proxy, error: err.message };
+  }
+}
+
+/**
  * Generates the X-Device-Fingerprint HTTP header required by Motorola RSA API.
  * Reverse engineered from webservices.dll by JoshRob.
  */
@@ -211,13 +371,14 @@ async function apiRequest(path, body = {}, opts = {}) {
 
   let response;
   try {
-    response = await fetch(url, {
+    response = await fetchWithRetry(url, {
       method: opts.method || "POST",
       headers,
       body: isBodyAllowed ? JSON.stringify(payload) : undefined
     });
   } catch (err) {
-    throw new Error(`Network failure connecting to ${url}: ${err.message}`);
+    console.error(formatNetworkFailure(url, err));
+    throw err;
   }
 
   updateCookies(response.headers);
@@ -229,7 +390,7 @@ async function apiRequest(path, body = {}, opts = {}) {
 
 async function fetchRsaKey() {
   try {
-    const r = await fetch(API_URL + "/common/rsa.jhtml", {
+    const r = await fetchWithRetry(API_URL + "/common/rsa.jhtml", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -249,7 +410,11 @@ async function fetchRsaKey() {
       session.rsaPublicKey = data.desc;
     }
   } catch (err) {
-    console.warn("[!] Warning: Could not fetch daily RSA public key:", err.message);
+    const detail = err.networkDetail || unwrapNetworkError(err);
+    console.warn(`[!] Warning: Could not fetch daily RSA public key: ${detail.code || err.message}`);
+    if (detail.code) {
+      console.warn(`[!] Transport detail: ${networkHint(detail)}`);
+    }
   }
 }
 
@@ -656,10 +821,12 @@ async function login() {
     while (true) {
       if (freshLoginRequired) {
         try {
-          const r0 = await fetch(BASE_URL + "/lmsa-web/index.jsp", { redirect: "manual" });
+          const r0 = await fetchWithRetry(BASE_URL + "/lmsa-web/index.jsp", { redirect: "manual" }, { attempts: 2 });
           updateCookies(r0.headers);
         } catch (err) {
-          console.warn("[!] Warning: Initial cookie handshake failed:", err.message);
+          const detail = err.networkDetail || unwrapNetworkError(err);
+          console.warn(`[!] Warning: Initial cookie handshake failed: ${detail.code || err.message}`);
+          console.warn(`[!] Transport detail: ${networkHint(detail)}`);
         }
 
         await fetchRsaKey();
@@ -1142,6 +1309,147 @@ async function searchParameters(modelName, json = false) {
   }
 }
 
+/**
+ * Isolates the connectivity stack layer by layer so a user can tell a local
+ * egress block apart from a backend outage without guesswork.
+ */
+function tlsProbe(host, port = 443, timeoutMs = 8000) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const done = (result) => {
+      if (settled) return;
+      settled = true;
+      try { socket.destroy(); } catch {}
+      resolve(result);
+    };
+
+    const socket = tlsConnect({ host, port, servername: host, timeout: timeoutMs }, () => {
+      const cert = (() => {
+        try { return socket.getPeerCertificate() || {}; } catch { return {}; }
+      })();
+      done({
+        ok: Boolean(socket.authorized),
+        authorizationError: socket.authorizationError ? String(socket.authorizationError) : null,
+        protocol: socket.getProtocol() || null,
+        cipher: socket.getCipher()?.name || null,
+        alpn: socket.alpnProtocol || null,
+        issuer: cert.issuer?.O || cert.issuer?.CN || null,
+        subject: cert.subject?.CN || null,
+        validTo: cert.valid_to || null
+      });
+    });
+
+    socket.setTimeout(timeoutMs, () => done({ ok: false, error: "ETIMEDOUT" }));
+    socket.on("error", (err) => done({ ok: false, error: `${err.code || err.message}` }));
+  });
+}
+
+async function runDoctor(jsonOutput = false) {
+  const host = new URL(BASE_URL).hostname;
+  const proxyEnv = process.env.HTTPS_PROXY || process.env.https_proxy ||
+    process.env.HTTP_PROXY || process.env.http_proxy || null;
+
+  const report = {
+    version: VERSION,
+    runtime: { node: process.version, platform: process.platform, arch: process.arch },
+    proxy: { env: proxyEnv, dispatcher: proxyStatus },
+    state: { file: STATE_FILE, exists: existsSync(STATE_FILE), hasSession: Boolean(session.jwt) },
+    dns: { host, addresses: [], error: null },
+    tls: null,
+    http: []
+  };
+
+  try {
+    const records = await lookup(host, { all: true });
+    report.dns.addresses = records.map((r) => `${r.address} (IPv${r.family})`);
+  } catch (err) {
+    const detail = unwrapNetworkError(err);
+    report.dns.error = detail.code || err.message;
+  }
+
+  report.tls = report.dns.error
+    ? { ok: false, error: "skipped: DNS resolution failed" }
+    : await tlsProbe(host);
+
+  const httpTargets = [
+    { label: "cookie handshake (GET)", path: "/lmsa-web/index.jsp", method: "GET" },
+    { label: "RSA public key (POST)", path: "/Interface/common/rsa.jhtml", method: "POST" },
+    { label: "login URL dictionary (POST)", path: "/Interface/dictionary/getApiInfo.jhtml", method: "POST" }
+  ];
+
+  for (const target of httpTargets) {
+    const url = BASE_URL + target.path;
+    try {
+      const r = await fetchWithRetry(url, {
+        method: target.method,
+        redirect: "manual",
+        headers: { "Content-Type": "application/json", "User-Agent": USER_AGENT, "Request-Tag": "lmsa" },
+        body: target.method === "POST" ? JSON.stringify({ client: { version: CLIENT_VERSION }, language: "en-US", dparams: {} }) : undefined
+      }, { attempts: 2, quiet: true });
+      report.http.push({ label: target.label, url, status: r.status, ok: true });
+    } catch (err) {
+      const detail = err.networkDetail || unwrapNetworkError(err);
+      report.http.push({ label: target.label, url, ok: false, code: detail.code || null, message: detail.message });    }
+  }
+
+  if (jsonOutput) {
+    console.log(JSON.stringify(report, null, 2));
+    return report;
+  }
+
+  const netOk = report.http.some((e) => e.ok);
+  console.log("========================================================================");
+  console.log(` MFD Connectivity Doctor - v${VERSION}`);
+  console.log("========================================================================");
+  console.log("\n[1] Runtime");
+  console.log(`    Node:     ${report.runtime.node}`);
+  console.log(`    Platform: ${report.runtime.platform}/${report.runtime.arch}`);
+  console.log("\n[2] Proxy");
+  console.log(`    Env:        ${proxyEnv || "none"}`);
+  console.log(`    Dispatcher: ${proxyStatus.configured ? `active (${proxyStatus.proxy})` : proxyStatus.error ? `FAILED to install (${proxyStatus.error})` : "direct connection"}`);
+  console.log("\n[3] DNS resolution");
+  if (report.dns.error) {
+    console.log(`    [FAIL] ${host} -> ${report.dns.error}`);
+    console.log(`    ${networkHint({ code: report.dns.error, hostname: host })}`);
+  } else {
+    console.log(`    [OK]   ${host} -> ${report.dns.addresses.join(", ")}`);
+  }
+  console.log("\n[4] TCP/TLS handshake (443)");
+  if (report.tls?.ok) {
+    console.log(`    [OK]   ${report.tls.protocol} / ${report.tls.cipher} / ALPN=${report.tls.alpn || "none"}`);
+    console.log(`           Chain CN: ${report.tls.subject} | Issuer: ${report.tls.issuer} | Valid to: ${report.tls.validTo}`);
+  } else {
+    console.log(`    [FAIL] ${report.tls?.error || report.tls?.authorizationError || "unknown"}`);
+    const tlsErr = String(report.tls?.authorizationError || report.tls?.error || "");
+    if (tlsErr && !/^skipped/i.test(tlsErr)) {
+      console.log(`    ${networkHint({ code: tlsErr, hostname: host })}`);
+    }
+  }
+  console.log("\n[5] HTTP probes");
+  for (const entry of report.http) {
+    if (entry.ok) {
+      console.log(`    [OK]   HTTP ${String(entry.status).padEnd(3)} ${entry.label}`);
+    } else {
+      console.log(`    [FAIL] ${entry.code || entry.message || "unknown"} ${entry.label}`);
+    }
+  }
+  console.log("\n[6] Local session state");
+  console.log(`    File:    ${report.state.file}`);
+  console.log(`    Session: ${report.state.hasSession ? "present" : "missing (run 'mfd login')"}`);
+  console.log("\n------------------------------------------------------------------------");
+  if (netOk) {
+    console.log("RESULT: backend reachable. If the wizard still fails, the fault is in");
+    console.log("        this local network path only for specific requests (proxy, MTU).");
+  } else {
+    console.log("RESULT: no request reached the Lenovo backend. The fault is on the");
+    console.log("        local egress path (DNS, firewall, AV/TLS inspection, proxy or");
+    console.log("        an ISP/regional block). The service itself answers normally when");
+    console.log("        reached over a clean route.");
+  }
+  console.log("------------------------------------------------------------------------");
+  return report;
+}
+
 function showHelp() {
   console.log(`Moto Firmware Downloader (MFD) v${VERSION}`);
   console.log("\nUsage:");
@@ -1149,6 +1457,7 @@ function showHelp() {
   console.log("  mfd login                            Authenticate with Motorola account");
   console.log("  mfd imei <Model> <IMEI> [options]    Lookup and download firmware for a device");
   console.log("  mfd search <Model> [--json]          Query required device match parameters");
+  console.log("  mfd doctor [--json]                  Diagnose DNS, TCP/TLS, proxy and HTTP reachability");
   console.log("\nOptions for 'imei':");
   console.log("  -c, --carrier <Carrier>   Carrier code (default: retla)");
   console.log("  -d, --download            Directly download ROM & Tool ZIP files");
@@ -1182,6 +1491,10 @@ function parseCliArgs(argv) {
 
   if (command === "login") {
     return { command };
+  }
+
+  if (command === "doctor" || command === "diagnose") {
+    return { command: "doctor", json: rest.includes("--json") };
   }
 
   if (command === "search") {
@@ -1254,19 +1567,36 @@ function parseCliArgs(argv) {
 loadState();
 const parsed = parseCliArgs(process.argv);
 
-if (parsed.command === "wizard") {
-  await runInteractiveWizard();
-} else if (parsed.command === "login") {
-  await login();
-} else if (parsed.command === "imei") {
-  await searchByImei(parsed.model, parsed.imei, {
-    carrier: parsed.carrier,
-    json: parsed.json,
-    urlsOnly: parsed.urlsOnly,
-    download: parsed.download,
-    outputDir: parsed.outputDir,
-    threads: parsed.threads
-  });
-} else if (parsed.command === "search") {
-  await searchParameters(parsed.model, parsed.json);
+try {
+  proxyStatus = await applyProxyFromEnv();
+
+  if (parsed.command === "wizard") {
+    await runInteractiveWizard();
+  } else if (parsed.command === "login") {
+    await login();
+  } else if (parsed.command === "doctor") {
+    await runDoctor(parsed.json);
+  } else if (parsed.command === "imei") {
+    await searchByImei(parsed.model, parsed.imei, {
+      carrier: parsed.carrier,
+      json: parsed.json,
+      urlsOnly: parsed.urlsOnly,
+      download: parsed.download,
+      outputDir: parsed.outputDir,
+      threads: parsed.threads
+    });
+  } else if (parsed.command === "search") {
+    await searchParameters(parsed.model, parsed.json);
+  }
+} catch (err) {
+  const detail = err.networkDetail || unwrapNetworkError(err);
+  if (err.networkDetail) {
+    console.error(formatNetworkFailure(err.message.replace(/^Network failure connecting to /, "").replace(/:.*$/, ""), err));
+  } else if (detail.code) {
+    console.error(`\n[!] ${err.message}\n`);
+    console.error(`[!] Transport layer: ${detail.code} - ${detail.message}`);
+  } else {
+    console.error(`\n[!] Fatal: ${err.message}\n`);
+  }
+  process.exit(1);
 }
