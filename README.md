@@ -163,12 +163,19 @@ Since v1.3.1 the login probe reports the endpoint it called, the verbatim server
 
 | Observed | Meaning | Action |
 |---|---|---|
-| `403 Invalid token.` | The value is not a session token (see below). | Use the JWT from `softwareFix://authcallback` |
+| `403 Invalid token.` | The token is not (or no longer) valid. | Generate a fresh session with `N` and paste immediately |
 | `410 Missing device fingerprint.` | The RSA key was not fetched before the call. | Check that `mfd doctor` shows the RSA probe as LMSA `0000` |
 | `412 Fingerprint expired.` | Clock skew on the machine. | Sync the system clock and retry |
 | `unexpected non-LMSA response (HTTP 404 ...)` | Something other than the Lenovo API answered. | A proxy, VPN, captive portal or antivirus HTTPS inspection is rewriting responses; run `mfd doctor` |
 
-**Which value to paste.** The working credential is the JWT from the `softwareFix://authcallback?Authorization=eyJ...` prompt (Firefox console or the success page, value starts with `eyJ`). The lowercase `softwarefix://callback?fullName=...&Authorization=<32 hex characters>` value is a one-time code that the browser has already consumed: the backend answers an identical `403 Invalid token.` for it and for a random control value, so it cannot be used as a session token. Paste it and the CLI will tell you exactly that.
+**Which value to paste.** Both token formats the LMSA flow offers work and are accepted by the backend:
+
+* `softwareFix://authcallback?Authorization=eyJ...` (JWT, from the browser prompt or console).
+* `softwarefix://callback?fullName=...&Authorization=<32 hex characters>`.
+
+Paste the whole URI or just the token value. These tokens are short-lived: an old or already-used token answers `403 Invalid token.`, so paste immediately after logging in.
+
+Do not paste the `code=...` parameter from the `lenovoIdSuccess.html` redirect URL: the browser's success page consumes that one-time code, and a second exchange answers `oauth2 state not found`.
 
 ### `Network failure connecting to https://lsa.lenovo.com/...: fetch failed`
 

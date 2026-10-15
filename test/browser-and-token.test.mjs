@@ -64,7 +64,7 @@ test("darwin and linux plans use native openers with the raw URL", () => {
   assert.deepEqual(linux.args, [OAUTH_URL]);
 });
 
-test("token classification distinguishes JWT from 32-hex one-time codes", () => {
+test("token classification distinguishes JWT from 32-hex session tokens", () => {
   const jwt = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.signature123";
   assert.equal(isJwtToken(jwt), true);
   assert.equal(isHex32Token(jwt), false);

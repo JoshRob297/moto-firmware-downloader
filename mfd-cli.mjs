@@ -27,7 +27,7 @@ import {
   createHash
 } from "node:crypto";
 
-const VERSION = "1.3.1";
+const VERSION = "1.3.2";
 const BASE_URL = "https://lsa.lenovo.com";
 const API_URL = BASE_URL + "/Interface";
 const USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
@@ -475,12 +475,13 @@ function openBrowser(targetUrl) {
 /**
  * Checks if a string matches an authorized session token format.
  * Accepts:
- * 1. Standard JWTs (starting with eyJ... with 3 segments): the value the LMSA
- *    backend actually accepts as a session token.
- * 2. 32-character hexadecimal values, kept for compatibility with older
- *    'softwarefix://callback' URIs. Verified against the live backend: any
- *    32-hex value is answered with an identical 'Invalid token.' response, so
- *    this format is accepted for input parsing but cannot authenticate.
+ * 1. Standard JWTs (starting with eyJ... with 3 segments), the value offered in
+ *    the 'softwareFix://authcallback?Authorization=eyJ...' prompt.
+ * 2. 32-character hexadecimal values, the value offered in the
+ *    'softwarefix://callback?...Authorization=<32 hex>' prompt.
+ *    Both are accepted by the backend: verified live, a fresh 32-hex token
+ *    authenticates the catalog endpoint (code 0000, request success) exactly
+ *    like a JWT. They are short-lived, so an older token answers 403.
  */
 function isValidSessionToken(str) {
   if (typeof str !== "string") return false;
@@ -795,13 +796,16 @@ async function verifyFileIntegrity(filePath, s3Etag = "", calculatedMd5 = "") {
 }
 
 /**
- * Live validation of session token against Motorola/Lenovo backend.
- * Returns { valid: boolean, reason?: string, status?: number, code?: string }
- */
-/**
  * Endpoint the tool actually consumes for catalog queries. Used as the live
  * validation probe so a successful probe guarantees a working session for the
  * commands that follow.
+ *
+ * History: v1.2.2 through v1.3.0 probed '/query/matchParams.jhtml', a path that
+ * does not exist. Unauthenticated requests to it are stopped by the auth gate
+ * (403 Invalid token), but an AUTHENTICATED request reaches the router and gets
+ * a Spring 404 Not Found, which carries no LMSA code/desc. The old fallback text
+ * then reported a valid token as "invalid or expired (Code: 404)". Always probe
+ * an endpoint the tool actually consumes.
  */
 const VALIDATION_PATH = "/rescueDevice/getRomMatchParams.jhtml";
 const VALIDATION_MODEL = "XT2435-1";
@@ -944,10 +948,10 @@ async function login() {
         console.log("   to open 'softwareFix://authcallback?Authorization=eyJ...'");
         console.log("\n   * In Firefox / Linux: Press F12 -> Console tab. Look for:");
         console.log('     Prevented navigation to "softwareFix://authcallback?...Authorization=eyJ..."');
-        console.log("     Copy that whole URI or just the JWT (starts with 'eyJ') and paste it below.");
-        console.log("   * Do NOT paste the 'softwarefix://callback?...Authorization=<32 hex chars>' value: it is");
-        console.log("     a one-time code consumed by the browser, and the backend rejects it as a session token.");
-        console.log("   * Important: Tokens expire in a few minutes. Please paste immediately.");
+        console.log("     Copy that whole URI or just the token ('eyJ...') and paste it below.");
+        console.log("   * The 'softwarefix://callback?...Authorization=<32 hex chars>' value also works:");
+        console.log("     paste the whole URI or just the 32-character value.");
+        console.log("   * Important: Tokens are short-lived. Paste immediately after logging in.");
         console.log("=======================================================\n");
 
         openBrowser(currentLoginUrl);
@@ -988,12 +992,10 @@ async function login() {
           console.warn("    fields (code/desc/msg). A proxy, VPN, captive portal or antivirus HTTPS");
           console.warn("    inspection layer answered instead. Run 'mfd doctor' to identify the layer.");
         } else if (isHex32Token(token)) {
-          console.warn("    The value you pasted is a 32-character hexadecimal code, which the Lenovo backend");
-          console.warn("    rejects whenever it is used as a session token (the same response is returned for");
-          console.warn("    a random control value). That URI is a one-time code already consumed by the");
-          console.warn("    browser, not a reusable credential.");
-          console.warn("    Use the JWT instead: copy the value from the 'softwareFix://authcallback?Authorization=eyJ...'");
-          console.warn("    prompt (Firefox console or success page after signing in) and paste it here.");
+          console.warn("    The token was rejected with 'Invalid token.'. A 32-character hexadecimal value is a");
+          console.warn("    valid session token format (verified against the live backend), but these tokens are");
+          console.warn("    short-lived: once used, or after a few minutes, the backend answers exactly this 403.");
+          console.warn("    Generate a fresh login session with 'N' and paste the new token immediately.");
         } else if (probe.transport) {
           console.warn("    The request never completed. Check the transport layer with 'mfd doctor'.");
         } else {
