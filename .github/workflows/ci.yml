@@ -41,3 +41,67 @@ jobs:
       if: runner.os != 'Windows'
       shell: bash
       run: bash -n install.sh
+
+  installer-unix:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Use Node.js 22.x
+      uses: actions/setup-node@v4
+      with:
+        node-version: 22.x
+
+    - name: Shellcheck installer
+      run: |
+        sudo apt-get update -qq
+        sudo apt-get install -y -qq shellcheck
+        shellcheck install.sh
+
+    - name: Install from working tree
+      run: |
+        MFD_DEST="$RUNNER_TEMP/mfd-bin" MFD_SOURCE="$PWD/mfd-cli.mjs" ./install.sh
+        "$RUNNER_TEMP/mfd-bin/mfd" --version
+
+    - name: Install from latest release asset
+      run: |
+        MFD_DEST="$RUNNER_TEMP/mfd-latest" bash ./install.sh
+        "$RUNNER_TEMP/mfd-latest/mfd" --version
+
+  installer-windows:
+    runs-on: windows-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Use Node.js 22.x
+      uses: actions/setup-node@v4
+      with:
+        node-version: 22.x
+
+    - name: Install from working tree
+      shell: pwsh
+      run: |
+        Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
+        $dest = Join-Path $env:RUNNER_TEMP 'mfd-install'
+        $env:MFD_DEST = $dest
+        $env:MFD_SOURCE = (Resolve-Path ./mfd-cli.mjs).Path
+        ./install.ps1
+        $shim = Join-Path $dest 'mfd.cmd'
+        if (-not (Test-Path $shim)) { throw "expected shim not found: $shim" }
+        $version = & $shim --version
+        Write-Host "installed version: $version"
+        if ($version -notmatch '^v\d+\.\d+\.\d+') { throw "unexpected version output: $version" }
+
+    - name: Install from latest release asset
+      shell: pwsh
+      run: |
+        Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
+        $dest = Join-Path $env:RUNNER_TEMP 'mfd-install-latest'
+        $env:MFD_DEST = $dest
+        Remove-Item Env:MFD_SOURCE -ErrorAction SilentlyContinue
+        ./install.ps1
+        $version = & (Join-Path $dest 'mfd.cmd') --version
+        Write-Host "installed version: $version"
+        if ($version -notmatch '^v\d+\.\d+\.\d+') { throw "unexpected version output: $version" }
