@@ -121,3 +121,11 @@ async function fetchRsaKey() {
     console.warn(\"[!] Warning: Could not fetch daily RSA public key:\", err.message);
   }
 }
+
+async function main() {
+  console.log(`Moto Firmware Downloader (MFD) v${VERSION} - CLI Tool`);
+}
+
+if (import.meta.url === `file://${process.argv[1]}`) {
+  main().catch(console.error);
+}
