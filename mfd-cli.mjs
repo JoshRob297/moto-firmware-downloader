@@ -27,7 +27,7 @@ import {
   createHash
 } from "node:crypto";
 
-const VERSION = "1.3.3";
+const VERSION = "1.3.4";
 const BASE_URL = "https://lsa.lenovo.com";
 const API_URL = BASE_URL + "/Interface";
 const USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
@@ -437,39 +437,86 @@ async function getLoginUrl() {
 }
 
 /**
+ * Escapes a URL for use inside a `cmd.exe /c start "" <url>` command line.
+ * cmd re-parses its own command line and treats & as a command separator, so a
+ * query string would be cut at the first ampersand unless it is escaped.
+ */
+function escapeForCmdStart(url) {
+  return String(url).replace(/[&^|<>]/g, (c) => "^" + c);
+}
+
+/**
  * Builds the platform command used to open a URL in the default browser.
  *
  * Windows note: `cmd.exe /c start` re-parses its own command line and treats `&`
  * as a command separator, so OAuth URLs are truncated at the first query
- * parameter (`...?state=X&client_id=Y` opens as `...?state=X`). explorer.exe
- * receives the URL as a plain argv entry and hands it to the shell untouched.
+ * parameter (`...?state=X&client_id=Y` opens as `...?state=X`). `explorer.exe`
+ * avoids the shell but does NOT accept a URL as an argument: it treats it as a
+ * path and opens its default folder (Documents), which is worse than failing.
+ * The reliable shell-free launcher is rundll32 with the URL file protocol
+ * handler, so that is the primary strategy.
+ *
+ * MFD_BROWSER overrides everything: the URL is appended as the final argument.
  * Kept pure so the argument construction is unit-testable on any platform.
  */
-function buildBrowserOpenCommand(platform, href) {
+function buildBrowserOpenCommand(platform, href, env = process.env) {
+  const override = (env.MFD_BROWSER || "").trim();
+  if (override) {
+    const parts = override.split(/\s+/).filter(Boolean);
+    return { command: parts[0], args: [...parts.slice(1), href], strategy: "MFD_BROWSER override" };
+  }
+
   if (platform === "win32") {
-    return { command: "explorer.exe", args: [href], fallback: { command: "rundll32.exe", args: ["url.dll,FileProtocolHandler", href] } };
+    return {
+      command: "rundll32.exe",
+      args: ["url.dll,FileProtocolHandler", href],
+      strategy: "rundll32 url.dll,FileProtocolHandler",
+      fallback: {
+        command: "cmd.exe",
+        args: ["/c", "start", "", `"${escapeForCmdStart(href)}"`],
+        strategy: "cmd /c start with escaped ampersands"
+      }
+    };
   }
   if (platform === "darwin") {
-    return { command: "open", args: [href] };
+    return { command: "open", args: [href], strategy: "open" };
   }
-  return { command: "xdg-open", args: [href], fallback: { command: "sensible-browser", args: [href] } };
+  return {
+    command: "xdg-open",
+    args: [href],
+    strategy: "xdg-open",
+    fallback: { command: "sensible-browser", args: [href], strategy: "sensible-browser" }
+  };
 }
 
-function openBrowser(targetUrl) {
+/**
+ * Attempts to open the URL and reports whether a launcher could be started.
+ * Returns { opened: boolean, strategy: string } so the caller can tell the user
+ * to copy the printed URL manually instead of assuming success.
+ */
+function openBrowser(targetUrl, opts = {}) {
   try {
     const parsed = new URL(targetUrl);
-    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return;
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+      return { opened: false, strategy: "rejected non-http url" };
+    }
 
-    const plan = buildBrowserOpenCommand(process.platform, parsed.href);
+    const plan = buildBrowserOpenCommand(process.platform, parsed.href, opts.env || process.env);
     const child = spawn(plan.command, plan.args, { stdio: "ignore", detached: true });
+
     child.on("error", () => {
+      if (opts.onFailure) opts.onFailure(plan);
       if (!plan.fallback) return;
       try {
         spawn(plan.fallback.command, plan.fallback.args, { stdio: "ignore", detached: true }).unref();
       } catch {}
     });
     child.unref();
-  } catch {}
+
+    return { opened: true, strategy: plan.strategy };
+  } catch {
+    return { opened: false, strategy: "launcher error" };
+  }
 }
 
 /**
@@ -900,10 +947,93 @@ async function validateTokenWithBackend(token) {
 /**
  * Authentication Flow with Interactive Retry and Fresh Session Generation
  */
-async function login() {
+/**
+ * Prints the verbatim diagnostics of a failed token validation. Used by both the
+ * interactive login loop and the non-interactive token paths (--token,
+ * --token-file, --stdin).
+ */
+function reportValidationFailure(probe, token) {
+  console.warn("\n[!] Backend Validation Failed");
+  console.warn(`    Endpoint: ${probe.url}`);
+  console.warn(`    Server response: ${probe.reason}${probe.code ? ` (code ${probe.code})` : ""}${probe.status ? ` [HTTP ${probe.status}]` : ""}`);
+  if (probe.detail) {
+    console.warn(`    Raw body: ${probe.detail}`);
+  }
+
+  if (probe.intercepted) {
+    console.warn("    The response did not come from the Lenovo API: it carries none of the LMSA");
+    console.warn("    fields (code/desc/msg). A proxy, VPN, captive portal or antivirus HTTPS");
+    console.warn("    inspection layer answered instead. Run 'mfd doctor' to identify the layer.");
+  } else if (isHex32Token(token)) {
+    console.warn("    The token was rejected with 'Invalid token.'. A 32-character hexadecimal value is a");
+    console.warn("    valid session token format (verified against the live backend), but these tokens are");
+    console.warn("    short-lived: once used, or after a few minutes, the backend answers exactly this 403.");
+    console.warn("    Generate a fresh login session and paste the new token immediately.");
+  } else if (probe.transport) {
+    console.warn("    The request never completed. Check the transport layer with 'mfd doctor'.");
+  } else {
+    console.warn("    This usually happens if the link is old or the session timed out.");
+  }
+
+  console.warn(`    Proxy: ${proxyStatus.configured ? `requests routed via ${proxyStatus.proxy}` : "direct connection"}`);
+}
+
+/**
+ * Reads all of stdin as UTF-8 text. Enables `Get-Clipboard | mfd login --stdin`,
+ * which bypasses the Windows console paste handling entirely.
+ */
+async function readStdinText() {
+  const chunks = [];
+  for await (const chunk of process.stdin) chunks.push(chunk);
+  return Buffer.concat(chunks.map((c) => Buffer.from(c))).toString("utf8");
+}
+
+/**
+ * Resolves a token supplied without the interactive prompt.
+ * Returns { source, raw } or null when no non-interactive input was requested.
+ */
+async function resolveProvidedToken(opts = {}) {
+  if (opts.token) return { source: "--token", raw: opts.token };
+  if (opts.tokenFile) {
+    if (!existsSync(opts.tokenFile)) {
+      console.error(`[!] Token file not found: ${opts.tokenFile}`);
+      process.exit(1);
+    }
+    return { source: `--token-file ${opts.tokenFile}`, raw: readFileSync(opts.tokenFile, "utf8") };
+  }
+  if (opts.stdin) return { source: "stdin", raw: await readStdinText() };
+  return null;
+}
+
+async function login(opts = {}) {
   if (session.jwt) {
     console.log("Notice: An active session is currently saved in", STATE_FILE);
     console.log("Proceeding with login will overwrite the existing token.\n");
+  }
+
+  // Non-interactive paths: --token, --token-file, --stdin.
+  // These bypass the console prompt entirely, which is the practical workaround
+  // for terminals that mangle pasted input (Windows conhost, tmux, SSH).
+  const provided = await resolveProvidedToken(opts);
+  if (provided) {
+    const token = await resolveTokenInput(provided.raw);
+    if (!token) {
+      console.error(`[!] Could not extract a valid token from ${provided.source}.`);
+      process.exit(1);
+    }
+
+    if (!session.rsaPublicKey) await fetchRsaKey();
+    console.log(`[i] Validating token from ${provided.source}...`);
+    const probe = await validateTokenWithBackend(token);
+    if (!probe.valid) {
+      reportValidationFailure(probe, token);
+      process.exit(1);
+    }
+
+    session.jwt = token;
+    saveState();
+    console.log(`[+] Login successful. Session saved to ${STATE_FILE}`);
+    return;
   }
 
   const rl = createInterface({ input: process.stdin, output: process.stdout });
@@ -960,7 +1090,14 @@ async function login() {
         console.log("   * Important: Tokens are short-lived. Paste immediately after logging in.");
         console.log("=======================================================\n");
 
-        openBrowser(currentLoginUrl);
+        const openResult = openBrowser(currentLoginUrl, {
+          onFailure: (plan) => {
+            console.log(`[!] Could not launch a browser (${plan.strategy}).`);
+          }
+        });
+        if (!openResult.opened) {
+          console.log("[!] Automatic browser launch unavailable. Copy the URL above and open it manually.");
+        }
         freshLoginRequired = false;
       }
 
@@ -986,29 +1123,7 @@ async function login() {
       const probe = await validateTokenWithBackend(token);
 
       if (!probe.valid) {
-        console.warn("\n[!] Backend Validation Failed");
-        console.warn(`    Endpoint: ${probe.url}`);
-        console.warn(`    Server response: ${probe.reason}${probe.code ? ` (code ${probe.code})` : ""}${probe.status ? ` [HTTP ${probe.status}]` : ""}`);
-        if (probe.detail) {
-          console.warn(`    Raw body: ${probe.detail}`);
-        }
-
-        if (probe.intercepted) {
-          console.warn("    The response did not come from the Lenovo API: it carries none of the LMSA");
-          console.warn("    fields (code/desc/msg). A proxy, VPN, captive portal or antivirus HTTPS");
-          console.warn("    inspection layer answered instead. Run 'mfd doctor' to identify the layer.");
-        } else if (isHex32Token(token)) {
-          console.warn("    The token was rejected with 'Invalid token.'. A 32-character hexadecimal value is a");
-          console.warn("    valid session token format (verified against the live backend), but these tokens are");
-          console.warn("    short-lived: once used, or after a few minutes, the backend answers exactly this 403.");
-          console.warn("    Generate a fresh login session with 'N' and paste the new token immediately.");
-        } else if (probe.transport) {
-          console.warn("    The request never completed. Check the transport layer with 'mfd doctor'.");
-        } else {
-          console.warn("    This usually happens if the link is old or the session timed out.");
-        }
-
-        console.warn(`    Proxy: ${proxyStatus.configured ? `requests routed via ${proxyStatus.proxy}` : "direct connection"}`);
+        reportValidationFailure(probe, token);
 
         const action = await rl.question("\nOptions: [R]e-paste, [N]ew fresh login URL, [F]orce save anyway, [Q]uit: ", { signal: ac.signal });
         const act = (action || "").trim().toLowerCase();
@@ -1045,24 +1160,149 @@ async function login() {
 /**
  * Query firmware with specific carrier
  */
-async function queryFirmwareByCarrier(modelName, imei, carrier) {
+/**
+ * Stable identity of a firmware build, used to collapse duplicates.
+ *
+ * Why not the download URL: the S3 URIs are pre-signed, so the same build served
+ * through two carriers comes back with two different URIs and survives a
+ * URI-based dedupe while looking identical to the user. Identity is therefore
+ * built from the human-visible build fields.
+ */
+function buildIdentity(item) {
+  const rom = item?.romResource || {};
+  const parts = [item?.marketName, rom.name, rom.publishDate, rom.size ?? rom.fileSize]
+    .filter((v) => v !== undefined && v !== null && v !== "")
+    .map(String);
+  if (parts.length >= 2) return "build:" + parts.join("|").toLowerCase();
+  return "uri:" + String(rom.uri || item?.toolResource?.uri || "").split("?")[0].toLowerCase();
+}
+
+/**
+ * Last catalog response, kept for diagnostics when nothing is found.
+ */
+let lastCatalogDiag = null;
+
+/**
+ * Classifies a device identifier as an IMEI or a serial number.
+ *
+ * WiFi-only tablets and some Lenovo devices have no cellular modem and therefore
+ * no IMEI; the official client identifies them by serial number. Both are
+ * accepted here so the lookup can proceed; see docs/DEVICE-IDENTIFIERS.md for the
+ * request-field mapping.
+ */
+function classifyDeviceId(raw) {
+  if (typeof raw !== "string") return null;
+  const value = raw.trim();
+  if (!value) return null;
+
+  const digitsOnly = value.replace(/[\s-]/g, "");
+  if (/^\d{14,16}$/.test(digitsOnly)) return { kind: "imei", value: digitsOnly };
+
+  if (/^[A-Za-z0-9]{6,32}$/.test(value)) return { kind: "serial", value: value.toUpperCase() };
+
+  return null;
+}
+
+/**
+ * Rescue endpoints, taken from the official client's string table
+ * (lenovo.mbg.service.lmsa.flash.dll, Software Fix v7.4.3.4). The official client
+ * uses three variants depending on how the device is identified:
+ *   getNewResourceByImei.jhtml  device identified by IMEI (cellular)
+ *   getNewResourceBySN.jhtml    device identified by serial number (WiFi-only)
+ *   getNewResource.jhtml        generic/resolved-on-server lookup
+ */
+const RESCUE_ENDPOINTS = {
+  byImei: "/rescueDevice/getNewResourceByImei.jhtml",
+  bySn: "/rescueDevice/getNewResourceBySN.jhtml",
+  generic: "/rescueDevice/getNewResource.jhtml",
+  marketSupport: "/rescueDevice/getMarketSupport.jhtml",
+  smartMarketNames: "/rescueDevice/smartMarketNames.jhtml"
+};
+
+/**
+ * Builds the lookup payload for a device identifier.
+ * Field names mirror the official client: `imei` for cellular devices,
+ * `serialno` for serial-number devices (tablets without a modem).
+ */
+function buildResourceQuery(modelName, identifier, carrier, kind) {
   const encryptCode = randomBytes(4).toString("hex").toUpperCase();
-  const r = await apiRequest("/rescueDevice/getNewResourceByImei.jhtml", {
-    imei,
+  const dparams = {
     modelCode: modelName,
     roCarrier: carrier,
     encryptCode,
     sku: modelName,
     carrierSku: modelName
-  });
+  };
+  if (kind === "serial") {
+    dparams.serialno = identifier;
+  } else {
+    dparams.imei = identifier;
+  }
+  return dparams;
+}
 
-  const data = await parseJsonResponse(r);
-  if (checkAuthFailure(r.status, data)) {
-    throw new Error("AUTH_EXPIRED");
+async function queryFirmwareByCarrier(modelName, identifier, carrier, kind = "imei") {
+  // Serial-number devices use a dedicated endpoint in the official client. That
+  // endpoint is not yet confirmed against the live API (needs a session to tell a
+  // missing route from a gated one), so fall back to the generic resource
+  // endpoint before giving up.
+  const endpoints = kind === "serial"
+    ? [RESCUE_ENDPOINTS.bySn, RESCUE_ENDPOINTS.generic]
+    : [RESCUE_ENDPOINTS.byImei];
+
+  let lastData = null;
+  let lastStatus = 0;
+
+  for (const endpoint of endpoints) {
+    const r = await apiRequest(endpoint, buildResourceQuery(modelName, identifier, carrier, kind));
+    const raw = await r.text();
+
+    let data = null;
+    try {
+      data = JSON.parse(raw);
+    } catch {}
+
+    if (data && checkAuthFailure(r.status, data)) {
+      throw new Error("AUTH_EXPIRED");
+    }
+
+    // A response without LMSA fields means the route itself is not served (a
+    // Spring 404 once the request is authenticated), not that the device is
+    // unknown: move on to the next endpoint instead of reporting "no firmware".
+    if (!isLmsaPayload(data)) {
+      lastCatalogDiag = {
+        endpoint,
+        model: modelName,
+        carrier,
+        code: null,
+        desc: `non-LMSA response (HTTP ${r.status})`,
+        contentType: "non-LMSA",
+        hasRomUri: false
+      };
+      continue;
+    }
+
+    const content = data.content;
+    lastData = data;
+    lastStatus = r.status;
+    lastCatalogDiag = {
+      endpoint,
+      model: modelName,
+      carrier,
+      code: data.code,
+      desc: data.desc,
+      contentType: Array.isArray(content) ? `array[${content.length}]` : typeof content,
+      hasRomUri: Array.isArray(content) && content.length > 0 ? Boolean(content[0]?.romResource?.uri) : false
+    };
+
+    if (data.code === "0000" && Array.isArray(content) && content.length > 0) {
+      return content[0];
+    }
   }
 
-  if (data?.code === "0000" && Array.isArray(data?.content) && data.content.length > 0) {
-    return data.content[0];
+  if (!lastData) {
+    console.warn(`[!] No rescue endpoint answered with an LMSA payload for carrier '${carrier}'.`);
+    if (lastStatus) console.warn(`[!] Last HTTP status: ${lastStatus}`);
   }
   return null;
 }
@@ -1070,28 +1310,44 @@ async function queryFirmwareByCarrier(modelName, imei, carrier) {
 /**
  * Discovers available firmwares across multiple software channels
  */
-async function discoverAvailableFirmwares(modelName, imei, customCarriers = []) {
+async function discoverAvailableFirmwares(modelName, identifier, customCarriers = [], kind = "imei") {
   const defaultCarriers = ["retla", "reteu", "retus", "retbr", "retin", "att", "vzw", "tmo", "altmx"];
   const carriersToQuery = [...new Set([...customCarriers, ...defaultCarriers])];
 
-  console.log(`\n[i] Querying Motorola firmware catalog for model: ${modelName} | IMEI: ${imei}...`);
+  console.log(`\n[i] Querying Motorola firmware catalog for model: ${modelName} | ${kind === "serial" ? "Serial" : "IMEI"}: ${identifier}...`);
 
   const results = [];
   const seenUris = new Set();
+  const seenBuilds = new Set();
+  let duplicatesSkipped = 0;
 
   const promises = carriersToQuery.map(async (carrier) => {
     try {
-      const item = await queryFirmwareByCarrier(modelName, imei, carrier);
-      if (item && item.romResource?.uri && !seenUris.has(item.romResource.uri)) {
-        seenUris.add(item.romResource.uri);
-        results.push(item);
+      const item = await queryFirmwareByCarrier(modelName, identifier, carrier, kind);
+      if (!item) return;
+
+      const romUri = item.romResource?.uri;
+      if (romUri && seenUris.has(romUri)) return;
+
+      const identity = buildIdentity(item);
+      if (seenBuilds.has(identity)) {
+        duplicatesSkipped += 1;
+        return;
       }
+
+      if (romUri) seenUris.add(romUri);
+      seenBuilds.add(identity);
+      results.push({ ...item, _queriedCarrier: carrier });
     } catch (err) {
       if (err.message === "AUTH_EXPIRED") throw err;
     }
   });
 
   await Promise.all(promises);
+
+  if (duplicatesSkipped > 0) {
+    console.log(`[i] Collapsed ${duplicatesSkipped} duplicate build entr${duplicatesSkipped === 1 ? "y" : "ies"} returned by other carriers.`);
+  }
   return results;
 }
 
@@ -1101,6 +1357,7 @@ async function discoverAvailableFirmwares(modelName, imei, customCarriers = []) 
 async function searchByImei(modelName, imei, options = {}) {
   const {
     carrier = "retla",
+    identifierKind = "imei",
     json = false,
     urlsOnly = false,
     download = false,
@@ -1118,12 +1375,12 @@ async function searchByImei(modelName, imei, options = {}) {
   }
 
   if (!json && !urlsOnly) {
-    console.log(`\nFetching firmware for model: ${modelName} | IMEI: ${imei} | Carrier: ${carrier}...`);
+    console.log(`\nFetching firmware for model: ${modelName} | ${identifierKind.toUpperCase()}: ${imei} | Carrier: ${carrier}...`);
   }
 
   let item;
   try {
-    item = await queryFirmwareByCarrier(modelName, imei, carrier);
+    item = await queryFirmwareByCarrier(modelName, imei, carrier, identifierKind);
   } catch (err) {
     if (err.message === "AUTH_EXPIRED") {
       console.error("\n[!] Authentication Error: Your session token is invalid or has expired.");
@@ -1139,6 +1396,10 @@ async function searchByImei(modelName, imei, options = {}) {
       console.error(JSON.stringify({ error: "No firmware found for specified carrier" }, null, 2));
     } else {
       console.error(`[!] No firmware found for model '${modelName}' under carrier '${carrier}'.`);
+      if (lastCatalogDiag) {
+        console.error(`[i] Last catalog response: endpoint=${lastCatalogDiag.endpoint} code=${lastCatalogDiag.code ?? "n/a"} desc=${lastCatalogDiag.desc ?? "n/a"} content=${lastCatalogDiag.contentType} romResource.uri=${lastCatalogDiag.hasRomUri}`);
+        console.error("[i] 'content=undefined' or a missing romResource.uri means the API returned no build for these match parameters.");
+      }
       console.error("[!] Try specifying a different carrier (e.g. --carrier reteu, retus, retbr).");
     }
     process.exit(1);
@@ -1276,24 +1537,28 @@ async function runInteractiveWizard() {
 
     // 3. Input IMEI
     let imei = "";
+    let identifierKind = "imei";
     while (!imei) {
-      const resp = await rl.question("[2/4] Enter Device IMEI (14-15 digits): ", { signal: ac.signal });
-      imei = resp.trim().replace(/\D/g, "");
-      if (imei.length < 14 || imei.length > 16) {
-        console.log("Invalid IMEI length. Please enter a valid 14-15 digit IMEI.");
-        imei = "";
+      const resp = await rl.question("[2/4] Enter Device IMEI (14-15 digits) or serial (WiFi-only tablets): ", { signal: ac.signal });
+      const classified = classifyDeviceId(resp);
+      if (!classified) {
+        console.log("Invalid identifier. Enter a 14-15 digit IMEI, or an alphanumeric serial of 6-32 characters.");
+        continue;
       }
+      imei = classified.value;
+      identifierKind = classified.kind;
+      console.log(`[i] Identifier accepted as ${classified.kind}: ${imei}`);
     }
 
     // 4. Discovery & Selection
     let firmwares = [];
     try {
-      firmwares = await discoverAvailableFirmwares(model, imei);
+      firmwares = await discoverAvailableFirmwares(model, imei, [], identifierKind);
     } catch (err) {
       if (err.message === "AUTH_EXPIRED") {
         console.error("\n[!] Authentication expired. Re-authenticating...");
         await login();
-        firmwares = await discoverAvailableFirmwares(model, imei);
+        firmwares = await discoverAvailableFirmwares(model, imei, [], identifierKind);
       } else {
         throw err;
       }
@@ -1319,7 +1584,9 @@ async function runInteractiveWizard() {
     console.log("========================================================================");
 
     firmwares.forEach((fw, idx) => {
-      console.log(`[${idx + 1}] Region / Carrier:  ${(fw.carrier || "DEFAULT").toUpperCase()}`);
+      const carrierLabel = (fw.carrier || "DEFAULT").toUpperCase();
+      const queried = fw._queriedCarrier && fw._queriedCarrier !== fw.carrier ? ` (queried: ${fw._queriedCarrier})` : "";
+      console.log(`[${idx + 1}] Region / Carrier:  ${carrierLabel}${queried}`);
       console.log(`    Market Name:        ${fw.marketName || "N/A"}`);
       console.log(`    Build Fingerprint:  ${fw.fingerPrint || "N/A"}`);
       console.log(`    ROM Package:        ${fw.romResource?.name || "N/A"}`);
@@ -1614,8 +1881,12 @@ function showHelp() {
   console.log(`Moto Firmware Downloader (MFD) v${VERSION}`);
   console.log("\nUsage:");
   console.log("  mfd                                  Launch interactive guided wizard");
-  console.log("  mfd login                            Authenticate with Motorola account");
-  console.log("  mfd imei <Model> <IMEI> [options]    Lookup and download firmware for a device");
+  console.log("  mfd login [options]                  Authenticate with Motorola account");
+  console.log("      --token <value>        Non-interactive: validate and save this token directly");
+  console.log("      --token-file <path>    Non-interactive: read the token from a file");
+  console.log("      --stdin                Non-interactive: read the token from stdin (Get-Clipboard | mfd login --stdin)");
+  console.log("  mfd imei <Model> <IMEI|Serial> [opts] Lookup and download firmware for a device");
+  console.log("                                        (WiFi-only tablets: pass the serial, optionally with --serial)");
   console.log("  mfd search <Model> [--json]          Query required device match parameters");
   console.log("  mfd doctor [--json]                  Diagnose DNS, TCP/TLS, proxy and HTTP reachability");
   console.log("\nOptions for 'imei':");
@@ -1625,6 +1896,7 @@ function showHelp() {
   console.log("  -t, --threads <Number>    Number of parallel download threads (default: 4)");
   console.log("      --json                Output result in JSON format (scripting friendly)");
   console.log("      --urls-only           Print only direct downloadable S3 URLs (one per line)");
+  console.log("      --serial              Treat the identifier as a device serial instead of an IMEI");
   console.log("\nGeneral Options:");
   console.log("  -h, --help                Show this help message");
   console.log("  -v, --version             Show version");
@@ -1650,7 +1922,29 @@ function parseCliArgs(argv) {
   const rest = args.slice(1);
 
   if (command === "login") {
-    return { command };
+    const opts = { command };
+    for (let i = 0; i < rest.length; i++) {
+      const arg = rest[i];
+      if (arg === "--token") {
+        if (!rest[i + 1]) {
+          console.error("Error: --token requires a value.");
+          process.exit(1);
+        }
+        opts.token = rest[++i];
+      } else if (arg === "--token-file") {
+        if (!rest[i + 1]) {
+          console.error("Error: --token-file requires a path.");
+          process.exit(1);
+        }
+        opts.tokenFile = rest[++i];
+      } else if (arg === "--stdin") {
+        opts.stdin = true;
+      } else {
+        console.error(`Error: Unknown flag '${arg}' for 'login'.`);
+        process.exit(1);
+      }
+    }
+    return opts;
   }
 
   if (command === "doctor" || command === "diagnose") {
@@ -1669,6 +1963,7 @@ function parseCliArgs(argv) {
 
   if (command === "imei") {
     let carrier = "retla";
+    let forceSerial = false;
     let json = false;
     let urlsOnly = false;
     let download = false;
@@ -1702,6 +1997,8 @@ function parseCliArgs(argv) {
         urlsOnly = true;
       } else if (arg === "-d" || arg === "--download") {
         download = true;
+      } else if (arg === "--serial") {
+        forceSerial = true;
       } else if (arg.startsWith("-")) {
         console.error(`Error: Unknown flag '${arg}'`);
         process.exit(1);
@@ -1711,12 +2008,28 @@ function parseCliArgs(argv) {
     }
 
     if (positional.length < 2) {
-      console.error("Error: Missing required arguments <Model> and <IMEI>.");
-      console.error("Usage: mfd imei <Model> <IMEI> [--carrier <Carrier>] [--download] [-o <Dir>] [--json] [--urls-only]");
+      console.error("Error: Missing required arguments <Model> and <IMEI|Serial>.");
+      console.error("Usage: mfd imei <Model> <IMEI|Serial> [--carrier <Carrier>] [--download] [-o <Dir>] [--json] [--urls-only] [--serial]");
       process.exit(1);
     }
 
-    return { command, model: positional[0], imei: positional[1], carrier, json, urlsOnly, download, outputDir, threads };
+    const identifier = classifyDeviceId(positional[1]);
+    if (!identifier) {
+      console.error(`Error: '${positional[1]}' is neither a 14-15 digit IMEI nor an alphanumeric serial.`);
+      console.error("       WiFi-only tablets have no IMEI: pass the device serial instead.");
+      process.exit(1);
+    }
+    if (forceSerial && identifier.kind === "imei") {
+      identifier.kind = "serial";
+    }
+
+    return {
+      command,
+      model: positional[0],
+      imei: identifier.value,
+      identifierKind: identifier.kind,
+      carrier, json, urlsOnly, download, outputDir, threads
+    };
   }
 
   console.error(`Error: Unknown command '${command}'.`);
@@ -1733,11 +2046,12 @@ try {
   if (parsed.command === "wizard") {
     await runInteractiveWizard();
   } else if (parsed.command === "login") {
-    await login();
+    await login(parsed);
   } else if (parsed.command === "doctor") {
     await runDoctor(parsed.json);
   } else if (parsed.command === "imei") {
     await searchByImei(parsed.model, parsed.imei, {
+      identifierKind: parsed.identifierKind,
       carrier: parsed.carrier,
       json: parsed.json,
       urlsOnly: parsed.urlsOnly,

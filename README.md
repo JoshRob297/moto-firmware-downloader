@@ -23,6 +23,7 @@ Older versions (`<= 1.2.4`) remain on the npm registry as frozen artifacts. They
 ## Key Features
 
 * **Interactive Guided Wizard:** Run `mfd` without arguments to launch a step-by-step assistant that searches, lists available regional builds, and downloads with one click.
+* **IMEI or Serial Lookup:** Cellular devices are looked up by IMEI, WiFi-only tablets by serial number, mirroring the endpoint the official client uses for each case. See [`docs/DEVICE-IDENTIFIERS.md`](docs/DEVICE-IDENTIFIERS.md).
 * **Guided Token Capture:** The login prompt prints the exact steps to grab the session token from the browser (console or Network tab). Both the JWT and the 32-character token formats are accepted. See [`docs/AUTHENTICATION.md`](docs/AUTHENTICATION.md).
 * **Accelerated Multi-Threaded Downloads:** Uses parallel HTTP `Range: bytes` chunks to maximize bandwidth on high-speed connections.
 * **Automated Integrity Verification:** Validates ZIP structural integrity (EOCD/Central Directory) and AWS S3 ETag/MD5 checksums after download.
@@ -111,6 +112,14 @@ mfd login
 
 Both token formats work: the JWT (`eyJ...`) from `softwareFix://authcallback` and the 32-character value from `softwarefix://callback`. Tokens are short-lived, so paste immediately. Do **not** paste the `code=` from the `lenovoIdSuccess.html` redirect URL - the browser consumes that one-time code before you can reuse it.
 
+Non-interactive alternatives, useful when a terminal mangles pasted input (Windows console, tmux, SSH):
+
+```bash
+mfd login --token "<token>"              # validate and save directly
+mfd login --token-file ~/token.txt       # read the token from a file
+Get-Clipboard | mfd login --stdin        # Windows PowerShell: pipe the clipboard
+```
+
 Full procedure, response-code table and troubleshooting: [`docs/AUTHENTICATION.md`](docs/AUTHENTICATION.md).
 
 *Tip for headless servers:* Export the token directly via environment variable:
@@ -120,8 +129,10 @@ export MFD_JWT="your_authorization_token_here"
 
 #### Lookup & Download Firmware
 ```bash
-mfd imei <Model> <IMEI> [options]
+mfd imei <Model> <IMEI|Serial> [options]
 ```
+
+Pass an IMEI (`14-15` digits) for cellular devices or a serial number for WiFi-only tablets; the identifier type is detected automatically, or forced with `--serial`.
 
 **Options:**
 * `-c, --carrier <Carrier>`: Target carrier channel (default: `retla`).
@@ -130,6 +141,7 @@ mfd imei <Model> <IMEI> [options]
 * `-t, --threads <Number>`: Number of parallel download threads (default: `4`).
 * `--json`: Output raw API response in structured JSON format (ideal for CI/automation).
 * `--urls-only`: Output only direct, signed AWS S3 download links (one per line) for piping into `curl`, `wget`, or `aria2c`.
+* `--serial`: Treat the identifier as a device serial number instead of an IMEI.
 
 **Examples:**
 ```bash
@@ -212,12 +224,24 @@ The Lenovo backend answers normally when reached over a clean route. A blanket f
 * **Corporate proxy:** export `HTTPS_PROXY=http://host:port`. MFD installs a proxy dispatcher automatically; with Node 24+ you can also start it as `NODE_USE_ENV_PROXY=1 node mfd-cli.mjs`.
 * **ISP or regional block:** if the doctor fails at DNS or TCP while the service is confirmed up, retry over a VPN or another network.
 
+### The login URL does not open in a browser
+
+`mfd login` tries to open the URL automatically. On Windows it uses `rundll32 url.dll,FileProtocolHandler`; `explorer.exe` is deliberately avoided because it treats the URL as a path and opens your Documents folder instead. If nothing opens, the URL is always printed in full: copy it manually.
+
+To force a specific browser or command:
+
+```bash
+MFD_BROWSER="firefox --new-window" mfd login     # Linux / macOS
+$env:MFD_BROWSER="C:\path\to\browser.exe"; mfd login   # Windows PowerShell
+```
+
 ### Other issues
 
 * **Browser opens a login page that errors out (Windows):** fixed in v1.3.1. Older builds launched the browser through `cmd.exe /c start`, which truncates OAuth URLs at the first `&`, so the page opened with only `?state=...`. The CLI now hands the full URL to `explorer.exe`. The console always printed the correct URL, so pasting it manually was the workaround.
 * **Command not found after installing:** the installer prints the PATH entry to add; restart the terminal afterwards on Windows.
 * **Authentication Error:** Re-run `mfd login` (or set `export MFD_JWT="..."`).
-* **Empty results / ROM not found:** Verify the exact model code (e.g. `XT2415-1` vs `XT2435-1`) and check different carrier channels (`retla`, `reteu`, `retus`, `retbr`).
+* **Empty results / ROM not found:** Verify the exact model code (e.g. `XT2415-1` vs `XT2435-1`) and check different carrier channels (`retla`, `reteu`, `retus`, `retbr`). MFD prints the last catalog response (endpoint, code, `content` shape) so you can see whether the API returned nothing or returned a build without a download resource. See [`docs/DEVICE-IDENTIFIERS.md`](docs/DEVICE-IDENTIFIERS.md).
+* **Duplicate entries in the firmware list:** MFD collapses builds that differ only by S3 signature. If two entries still look identical, the carrier line distinguishes them (the list shows the queried carrier when it differs from the reported one).
 * **Running an old copy:** verify with `mfd --version` and re-run the installer to move to the latest release.
 
 ---
